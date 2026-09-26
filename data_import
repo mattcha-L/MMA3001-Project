@@ -1,183 +1,166 @@
 """
-Sensor CSV Parser
+Import a sensor-log CSV and split it into per-variable arrays
 ========================================================================
-Parses a CSV/TSV export where each row bundles several sensor readings
-as a JSON array in one column, e.g.:
+Expects a comma-delimited CSV with a header row:
 
-    2   6.012E+12   env   [{"values": [{"time": 1702273965, "value": 4.1875}],
-                            "variable": {"id": 66, "name": "Battery", "unit": "V",
-                                         "source": 0, "structure": 32834}},
-                           ... more variables ...]   Processed   NULL
-                           2024-02-29 03:11:58.210358+11
-                           2024-02-29 03:11:58.210358+11
+    id,sensorid,devicetype,jsondata,status,processing_errors,createdate,processdate
 
-Assumed column layout (0-indexed, adjust COLUMN_* below if yours differs):
+`jsondata` is a JSON array, standard CSV-quoted (fields containing
+commas/quotes are wrapped in "..." with internal quotes doubled).
+Each element looks like:
 
-    0  row_id
-    1  device_id          (e.g. "6.012E+12")
-    2  env_type           (e.g. "env")
-    3  readings_json      <- the JSON array of {values, variable}
-    4  status             (e.g. "Processed")
-    5  note               (e.g. literal "NULL")
-    6  created_at
-    7  updated_at
+    {"values": [{"time": 1702273965, "value": 603}],
+     "variable": {"id": 67, "name": "Carbon dioxide", "unit": "ppm", ...}}
 
-Produces two outputs:
-    * long format  -- one row per (row_id, variable, timestamp) reading
-    * wide format  -- one row per timestamp, one column per variable
-                       (ready to drop straight into a regression model,
-                       e.g. Carbon dioxide ~ Temperature + Humidity + Pressure)
+This version reads the whole file at once with pandas (vectorized,
+C-level CSV parsing) and vectorizes everything downstream that can be
+vectorized: date parsing runs once over a whole column instead of once
+per row, and per-variable arrays are built with a single reindex +
+to_numpy() call rather than a manual list-per-variable loop. Only the
+JSON parsing itself stays row-wise -- each blob is an independent
+document, so there's no way around visiting each one -- but even that
+runs as a single vectorized .map() rather than an explicit for-loop.
+
+Produces the same outputs as before: row_ids, timestamps, created_at,
+processed_at, and one NumPy array per sensor variable (co2,
+temperature, humidity, pressure, ...), all aligned by index.
 ========================================================================
 """
 
-import csv
 import json
-import sys
-from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 
-COLUMN_ROW_ID = 0
-COLUMN_DEVICE_ID = 1
-COLUMN_ENV_TYPE = 2
-COLUMN_JSON = 3
-COLUMN_STATUS = 4
-COLUMN_NOTE = 5
-COLUMN_CREATED_AT = 6
-COLUMN_UPDATED_AT = 7
+PATH = "5EnvSensor_MayToDec2024_180kRows.csv"  # <- change to your file's path
+
+# The variables we want as named arrays. Add/remove names here -- the
+# key must match the JSON "name" field exactly. Any variable name that
+# never shows up anywhere in the file simply becomes an all-NaN column,
+# same as before.
+VARIABLE_NAMES = [
+    "Battery",
+    "Carbon dioxide",
+    "Humidity",
+    "Formaldehyde",
+    "Pressure",
+    "Temperature",
+    "Light Volatile Organic Compounds",
+    "Particulate matter 1",
+    "Particulate matter 4",
+    "Particulate matter 2.5",
+    "Particulate matter 10",
+]
 
 
-def fix_mojibake(text):
-    """
-    Repairs the classic 'UTF-8 bytes decoded as Latin-1' mangling seen
-    in this data's unit strings (e.g. 'Âµg/m3' -> 'µg/m3', 'Â°C' -> '°C').
-    Re-encoding the mangled string as Latin-1 recovers the original
-    UTF-8 bytes, which then decode correctly. Falls back to the
-    original string if that round-trip isn't valid.
-    """
-    if not isinstance(text, str) or "Â" not in text:
-        return text
+def _safe_json_loads(text):
+    """None on bad JSON instead of raising, so one bad row doesn't kill the whole load."""
     try:
-        return text.encode("latin-1").decode("utf-8")
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        return text
-
-
-def none_if_null(value):
-    """Treats a literal 'NULL' string (case-insensitive) or blank as a real None."""
-    if value is None:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
         return None
-    stripped = value.strip()
-    return None if stripped == "" or stripped.upper() == "NULL" else stripped
 
 
-def detect_delimiter(path, sample_size=4096):
+def _flatten(readings):
     """
-    Picks the field delimiter. csv.Sniffer alone is unreliable here
-    because the embedded JSON is full of commas, which can outnumber
-    the real (tab) delimiters and fool a naive frequency-based guess.
-    A literal tab character essentially never appears inside this
-    JSON, so its presence is a strong, cheap signal this file is
-    tab-delimited; only fall back to sniffing comma/semicolon when no
-    tab shows up at all.
+    Turns one row's JSON reading list into a single flat dict:
+    {"Battery": 4.1875, "Carbon dioxide": 603, ..., "_time": 1702273965}
+    "_time" is the shared Unix-epoch timestamp for the row (seconds, UTC).
     """
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        sample = f.read(sample_size)
-    if "\t" in sample:
-        return "\t"
-    try:
-        return csv.Sniffer().sniff(sample, delimiters=",;").delimiter
-    except csv.Error:
-        return ","
+    record = {}
+    row_time = None
+    for entry in readings:
+        variable = entry.get("variable", {})
+        name = variable.get("name")
+        values = entry.get("values", [])
+        if not values:
+            continue                      # no reading at all for this variable
+        point = values[0]                 # first/only reading per variable
+        if "time" in point:
+            row_time = point["time"]      # shared timestamp for the row
+        if name is not None:
+            record[name] = point.get("value")  # None if value is missing
+    record["_time"] = row_time
+    return record
 
 
-def parse_sensor_csv(path, delimiter=None, fix_encoding=True):
-    """
-    Streams the file row by row (fine for large files) and flattens
-    each row's JSON reading list into individual records.
-    Returns a long-format pandas DataFrame.
-    """
-    if delimiter is None:
-        delimiter = detect_delimiter(path)
+# ------------------------------------------------------------------
+# 1. Read the whole file at once -- vectorized C-level CSV parsing,
+#    versus a Python-level csv.DictReader loop.
+# ------------------------------------------------------------------
+raw = pd.read_csv(PATH, dtype=str)
 
-    records = []
-    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
-        reader = csv.reader(f, delimiter=delimiter)
-        for row_num, row in enumerate(reader, start=1):
-            if len(row) <= COLUMN_JSON:
-                print(f"[skip] row {row_num}: only {len(row)} column(s), "
-                      f"expected at least {COLUMN_JSON + 1}", file=sys.stderr)
-                continue
+# ------------------------------------------------------------------
+# 2. Parse the JSON blobs. Inherently row-wise (each blob is its own
+#    document), but done as one vectorized .map() call, and bad rows
+#    are dropped in a single boolean-mask operation instead of a
+#    per-row try/except inside a loop.
+# ------------------------------------------------------------------
+readings_col = raw["jsondata"].map(_safe_json_loads)
+bad = readings_col.isna()
+if bad.any():
+    print(f"[skip] {bad.sum()} row(s) with unreadable jsondata: ids {raw.loc[bad, 'id'].tolist()}")
+raw = raw.loc[~bad].reset_index(drop=True)
+readings_col = readings_col.loc[~bad].reset_index(drop=True)
 
-            row_id = row[COLUMN_ROW_ID]
-            device_id = row[COLUMN_DEVICE_ID]
-            env_type = row[COLUMN_ENV_TYPE]
-            status = none_if_null(row[COLUMN_STATUS]) if len(row) > COLUMN_STATUS else None
-            note = none_if_null(row[COLUMN_NOTE]) if len(row) > COLUMN_NOTE else None
-            created_at = row[COLUMN_CREATED_AT] if len(row) > COLUMN_CREATED_AT else None
-            updated_at = row[COLUMN_UPDATED_AT] if len(row) > COLUMN_UPDATED_AT else None
+# ------------------------------------------------------------------
+# 3. Flatten each row to one dict, then build the wide table in a
+#    single pd.DataFrame() call. This replaces the old nested loop
+#    (extract per-variable values, then loop again to append into
+#    per-variable lists) with one pass per row plus one vectorized
+#    table construction.
+# ------------------------------------------------------------------
+records = readings_col.map(_flatten)
+wide = pd.DataFrame(records.tolist())
 
-            try:
-                readings = json.loads(row[COLUMN_JSON])
-            except json.JSONDecodeError as e:
-                print(f"[skip] row {row_num}: bad JSON ({e})", file=sys.stderr)
-                continue
+# Guarantee every expected variable is present as a column (missing
+# ones become all-NaN) in a single vectorized reindex, rather than a
+# per-variable .get()/fallback loop.
+wide_vars = wide.reindex(columns=VARIABLE_NAMES)
 
-            for entry in readings:
-                variable = entry.get("variable", {})
-                var_name = variable.get("name")
-                var_unit = variable.get("unit")
-                if fix_encoding:
-                    var_name = fix_mojibake(var_name)
-                    var_unit = fix_mojibake(var_unit)
+# ------------------------------------------------------------------
+# 4. Vectorized date handling: each column is converted ONCE, in one
+#    call, instead of once per row inside the read loop.
+# ------------------------------------------------------------------
+row_ids = raw["id"].to_numpy()
+# "_time" is a Unix epoch (seconds, always UTC by definition -- no
+# local-timezone ambiguity here). Rows with no time found stay NaT
+# rather than being dropped or miscoded as a falsy-but-valid epoch 0.
+timestamps = pd.to_datetime(wide["_time"], unit="s", utc=True).to_numpy()
+# createdate / processdate are ISO-like strings with a numeric UTC
+# offset (e.g. "2024-02-29 03:11:58.210358+11"). utc=True is required
+# here, not optional: Melbourne's offset changes between +11 (AEDT)
+# and +10 (AEST) across the DST boundary, so a file spanning more than
+# a few months will have mixed offsets in this column. Without
+# utc=True, pandas can't build one consistent datetime64 array from
+# mixed offsets and raises a ValueError partway through -- utc=True
+# normalizes everything onto a single UTC timeline first.
+created_at = pd.to_datetime(raw["createdate"], utc=True).to_numpy()
+processed_at = pd.to_datetime(raw["processdate"], utc=True).to_numpy()
 
-                for point in entry.get("values", []):
-                    t = point.get("time")
-                    records.append({
-                        "row_id": row_id,
-                        "device_id": device_id,
-                        "env_type": env_type,
-                        "variable_id": variable.get("id"),
-                        "variable_name": var_name,
-                        "unit": var_unit,
-                        "source": variable.get("source"),
-                        "structure": variable.get("structure"),
-                        "timestamp_unix": t,
-                        "datetime_utc": datetime.fromtimestamp(t, tz=timezone.utc) if t is not None else None,
-                        "value": point.get("value"),
-                        "status": status,
-                        "note": note,
-                        "created_at": created_at,
-                        "updated_at": updated_at,
-                    })
-
-    return pd.DataFrame(records)
-
-
-def to_wide(df, index_col="datetime_utc", columns_col="variable_name", values_col="value"):
-    """
-    Pivots long -> wide: one row per timestamp, one column per variable.
-    This is the shape a regression model wants (e.g. columns
-    'Carbon dioxide', 'Temperature', 'Humidity', 'Pressure').
-    """
-    wide = df.pivot_table(index=index_col, columns=columns_col, values=values_col, aggfunc="first")
-    wide = wide.reset_index().sort_values(index_col)
-    wide.columns.name = None
-    return wide
-
+# ------------------------------------------------------------------
+# 5. Pull out each named variable as a NumPy array with one
+#    vectorized .to_numpy() call per column (no manual per-row
+#    list building).
+# ------------------------------------------------------------------
+battery = wide_vars["Battery"].to_numpy(dtype=float)
+co2 = wide_vars["Carbon dioxide"].to_numpy(dtype=float)
+humidity = wide_vars["Humidity"].to_numpy(dtype=float)
+formaldehyde = wide_vars["Formaldehyde"].to_numpy(dtype=float)
+pressure = wide_vars["Pressure"].to_numpy(dtype=float)
+temperature = wide_vars["Temperature"].to_numpy(dtype=float)
+voc = wide_vars["Light Volatile Organic Compounds"].to_numpy(dtype=float)
+pm1 = wide_vars["Particulate matter 1"].to_numpy(dtype=float)
+pm4 = wide_vars["Particulate matter 4"].to_numpy(dtype=float)
+pm25 = wide_vars["Particulate matter 2.5"].to_numpy(dtype=float)
+pm10 = wide_vars["Particulate matter 10"].to_numpy(dtype=float)
 
 if __name__ == "__main__":
-    INPUT_PATH = "sensor_data.csv"  # <- change to your file's path
-
-    long_df = parse_sensor_csv(INPUT_PATH)
-    print(f"Parsed {len(long_df)} readings from {long_df['row_id'].nunique()} row(s), "
-          f"{long_df['variable_name'].nunique()} variable(s): "
-          f"{sorted(long_df['variable_name'].dropna().unique())}")
-
-    long_df.to_csv("sensor_data_long.csv", index=False)
-
-    wide_df = to_wide(long_df)
-    wide_df.to_csv("sensor_data_wide.csv", index=False)
-
-    print("\nWide-format preview:")
-    print(wide_df.head())
+    print(f"Loaded {len(row_ids)} rows")
+    print("row_ids:     ", row_ids)
+    print("timestamps:  ", timestamps[:3], "...")
+    print("created_at:  ", created_at[:3], "...")
+    print("co2:         ", co2)
+    print("temperature: ", temperature)
+    print("humidity:    ", humidity)
+    print("pressure:    ", pressure)
