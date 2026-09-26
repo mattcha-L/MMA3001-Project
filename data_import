@@ -1,0 +1,183 @@
+"""
+Sensor CSV Parser
+========================================================================
+Parses a CSV/TSV export where each row bundles several sensor readings
+as a JSON array in one column, e.g.:
+
+    2   6.012E+12   env   [{"values": [{"time": 1702273965, "value": 4.1875}],
+                            "variable": {"id": 66, "name": "Battery", "unit": "V",
+                                         "source": 0, "structure": 32834}},
+                           ... more variables ...]   Processed   NULL
+                           2024-02-29 03:11:58.210358+11
+                           2024-02-29 03:11:58.210358+11
+
+Assumed column layout (0-indexed, adjust COLUMN_* below if yours differs):
+
+    0  row_id
+    1  device_id          (e.g. "6.012E+12")
+    2  env_type           (e.g. "env")
+    3  readings_json      <- the JSON array of {values, variable}
+    4  status             (e.g. "Processed")
+    5  note               (e.g. literal "NULL")
+    6  created_at
+    7  updated_at
+
+Produces two outputs:
+    * long format  -- one row per (row_id, variable, timestamp) reading
+    * wide format  -- one row per timestamp, one column per variable
+                       (ready to drop straight into a regression model,
+                       e.g. Carbon dioxide ~ Temperature + Humidity + Pressure)
+========================================================================
+"""
+
+import csv
+import json
+import sys
+from datetime import datetime, timezone
+
+import pandas as pd
+
+COLUMN_ROW_ID = 0
+COLUMN_DEVICE_ID = 1
+COLUMN_ENV_TYPE = 2
+COLUMN_JSON = 3
+COLUMN_STATUS = 4
+COLUMN_NOTE = 5
+COLUMN_CREATED_AT = 6
+COLUMN_UPDATED_AT = 7
+
+
+def fix_mojibake(text):
+    """
+    Repairs the classic 'UTF-8 bytes decoded as Latin-1' mangling seen
+    in this data's unit strings (e.g. 'Âµg/m3' -> 'µg/m3', 'Â°C' -> '°C').
+    Re-encoding the mangled string as Latin-1 recovers the original
+    UTF-8 bytes, which then decode correctly. Falls back to the
+    original string if that round-trip isn't valid.
+    """
+    if not isinstance(text, str) or "Â" not in text:
+        return text
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return text
+
+
+def none_if_null(value):
+    """Treats a literal 'NULL' string (case-insensitive) or blank as a real None."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return None if stripped == "" or stripped.upper() == "NULL" else stripped
+
+
+def detect_delimiter(path, sample_size=4096):
+    """
+    Picks the field delimiter. csv.Sniffer alone is unreliable here
+    because the embedded JSON is full of commas, which can outnumber
+    the real (tab) delimiters and fool a naive frequency-based guess.
+    A literal tab character essentially never appears inside this
+    JSON, so its presence is a strong, cheap signal this file is
+    tab-delimited; only fall back to sniffing comma/semicolon when no
+    tab shows up at all.
+    """
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        sample = f.read(sample_size)
+    if "\t" in sample:
+        return "\t"
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",;").delimiter
+    except csv.Error:
+        return ","
+
+
+def parse_sensor_csv(path, delimiter=None, fix_encoding=True):
+    """
+    Streams the file row by row (fine for large files) and flattens
+    each row's JSON reading list into individual records.
+    Returns a long-format pandas DataFrame.
+    """
+    if delimiter is None:
+        delimiter = detect_delimiter(path)
+
+    records = []
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        reader = csv.reader(f, delimiter=delimiter)
+        for row_num, row in enumerate(reader, start=1):
+            if len(row) <= COLUMN_JSON:
+                print(f"[skip] row {row_num}: only {len(row)} column(s), "
+                      f"expected at least {COLUMN_JSON + 1}", file=sys.stderr)
+                continue
+
+            row_id = row[COLUMN_ROW_ID]
+            device_id = row[COLUMN_DEVICE_ID]
+            env_type = row[COLUMN_ENV_TYPE]
+            status = none_if_null(row[COLUMN_STATUS]) if len(row) > COLUMN_STATUS else None
+            note = none_if_null(row[COLUMN_NOTE]) if len(row) > COLUMN_NOTE else None
+            created_at = row[COLUMN_CREATED_AT] if len(row) > COLUMN_CREATED_AT else None
+            updated_at = row[COLUMN_UPDATED_AT] if len(row) > COLUMN_UPDATED_AT else None
+
+            try:
+                readings = json.loads(row[COLUMN_JSON])
+            except json.JSONDecodeError as e:
+                print(f"[skip] row {row_num}: bad JSON ({e})", file=sys.stderr)
+                continue
+
+            for entry in readings:
+                variable = entry.get("variable", {})
+                var_name = variable.get("name")
+                var_unit = variable.get("unit")
+                if fix_encoding:
+                    var_name = fix_mojibake(var_name)
+                    var_unit = fix_mojibake(var_unit)
+
+                for point in entry.get("values", []):
+                    t = point.get("time")
+                    records.append({
+                        "row_id": row_id,
+                        "device_id": device_id,
+                        "env_type": env_type,
+                        "variable_id": variable.get("id"),
+                        "variable_name": var_name,
+                        "unit": var_unit,
+                        "source": variable.get("source"),
+                        "structure": variable.get("structure"),
+                        "timestamp_unix": t,
+                        "datetime_utc": datetime.fromtimestamp(t, tz=timezone.utc) if t is not None else None,
+                        "value": point.get("value"),
+                        "status": status,
+                        "note": note,
+                        "created_at": created_at,
+                        "updated_at": updated_at,
+                    })
+
+    return pd.DataFrame(records)
+
+
+def to_wide(df, index_col="datetime_utc", columns_col="variable_name", values_col="value"):
+    """
+    Pivots long -> wide: one row per timestamp, one column per variable.
+    This is the shape a regression model wants (e.g. columns
+    'Carbon dioxide', 'Temperature', 'Humidity', 'Pressure').
+    """
+    wide = df.pivot_table(index=index_col, columns=columns_col, values=values_col, aggfunc="first")
+    wide = wide.reset_index().sort_values(index_col)
+    wide.columns.name = None
+    return wide
+
+
+if __name__ == "__main__":
+    INPUT_PATH = "sensor_data.csv"  # <- change to your file's path
+
+    long_df = parse_sensor_csv(INPUT_PATH)
+    print(f"Parsed {len(long_df)} readings from {long_df['row_id'].nunique()} row(s), "
+          f"{long_df['variable_name'].nunique()} variable(s): "
+          f"{sorted(long_df['variable_name'].dropna().unique())}")
+
+    long_df.to_csv("sensor_data_long.csv", index=False)
+
+    wide_df = to_wide(long_df)
+    wide_df.to_csv("sensor_data_wide.csv", index=False)
+
+    print("\nWide-format preview:")
+    print(wide_df.head())
