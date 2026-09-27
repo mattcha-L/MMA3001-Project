@@ -1,0 +1,105 @@
+"""
+Visualize weekly sensor data
+========================================================================
+Plots one chosen environmental variable over time, with time on the
+x-axis, drawing a SEPARATE graph for each selected week. Built directly
+on top of import_sensor_csv.py (raw arrays) and weekly_grouping.py's
+group_by_week() (weekly buckets) -- no changes needed to either file.
+
+Change the two settings below, then run this script:
+
+    VARIABLE_TO_PLOT -- which environmental variable to plot (y-axis)
+    WEEKS_TO_PLOT    -- "all", or a list of specific week-start dates
+========================================================================
+"""
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+from import_sensor_csv import (
+    row_ids, timestamps, battery, co2, humidity, formaldehyde,
+    pressure, temperature, voc, pm1, pm4, pm25, pm10,
+)
+from weekly_grouping import group_by_week
+
+# ------------------------------------------------------------------
+# Human-changeable settings
+# ------------------------------------------------------------------
+VARIABLE_TO_PLOT = "co2"   # <- change to any key in AVAILABLE_VARIABLES below
+
+WEEKS_TO_PLOT = "all"
+# WEEKS_TO_PLOT = ["2023-12-05", "2024-02-27"]   # <- or a list of specific week-start dates (as printed by this script / weekly_grouping.py)
+
+# Maps a short, typeable key to (array, display name, unit) for each variable.
+# Add/remove entries here if import_sensor_csv.py's variable list changes.
+AVAILABLE_VARIABLES = {
+    "battery": (battery, "Battery", "V"),
+    "co2": (co2, "Carbon dioxide", "ppm"),
+    "humidity": (humidity, "Humidity", "HR%"),
+    "formaldehyde": (formaldehyde, "Formaldehyde", "\u00b5g/m3"),
+    "pressure": (pressure, "Pressure", "mb"),
+    "temperature": (temperature, "Temperature", "\u00b0C"),
+    "voc": (voc, "Light Volatile Organic Compounds", "ppb"),
+    "pm1": (pm1, "Particulate matter 1", "\u00b5g/m3"),
+    "pm4": (pm4, "Particulate matter 4", "\u00b5g/m3"),
+    "pm25": (pm25, "Particulate matter 2.5", "\u00b5g/m3"),
+    "pm10": (pm10, "Particulate matter 10", "\u00b5g/m3"),
+}
+# ------------------------------------------------------------------
+
+
+def plot_weekly(variable_key, weeks_to_plot="all"):
+    """
+    Draws one time-series subplot per selected week for the chosen
+    variable. Returns the Figure (or None if there was nothing to plot).
+
+    variable_key : one of AVAILABLE_VARIABLES' keys, e.g. "co2"
+    weeks_to_plot : "all", or a list of week-start dates (strings like
+                    "2023-12-05", pandas Timestamps, or datetimes) --
+                    these are the same week-start labels group_by_week()
+                    and weekly_grouping.py print out.
+    """
+    if variable_key not in AVAILABLE_VARIABLES:
+        raise ValueError(f"Unknown variable '{variable_key}'. Choose from: {list(AVAILABLE_VARIABLES)}")
+    values, display_name, unit = AVAILABLE_VARIABLES[variable_key]
+
+    weekly_groups, _ = group_by_week(timestamps, row_id=row_ids, value=values)
+
+    if weeks_to_plot == "all":
+        selected_weeks = sorted(weekly_groups)
+    else:
+        wanted = {pd.Timestamp(w) for w in weeks_to_plot}
+        selected_weeks = sorted(w for w in weekly_groups if w in wanted)
+        missing = wanted - set(selected_weeks)
+        if missing:
+            print(f"[warning] no data for requested week(s): {sorted(str(m.date()) for m in missing)}")
+
+    if not selected_weeks:
+        print("No weeks to plot -- check WEEKS_TO_PLOT against the available weeks:")
+        print(sorted(str(w.date()) for w in weekly_groups))
+        return None
+
+    fig, axes = plt.subplots(len(selected_weeks), 1, figsize=(10, 4 * len(selected_weeks)), squeeze=False)
+    for ax, week_start in zip(axes[:, 0], selected_weeks):
+        group = weekly_groups[week_start].sort_values("timestamp")
+        ax.plot(group["timestamp"], group["value"], marker="o")
+        ax.set_title(f"{display_name} -- week of {week_start.date()}")
+        ax.set_xlabel("Time")
+        ax.set_ylabel(f"{display_name} ({unit})")
+        ax.tick_params(axis="x", rotation=30)
+        # Bound the x-axis to the actual calendar week rather than letting
+        # matplotlib auto-scale from the data -- with only one reading in
+        # a week, auto-scaling produces an absurdly wide, uninformative range.
+        ax.set_xlim(week_start, week_start + pd.Timedelta(days=7))
+
+    fig.tight_layout()
+    return fig
+
+
+if __name__ == "__main__":
+    print("Available weeks:", sorted(str(w.date()) for w in group_by_week(timestamps)[0]))
+    fig = plot_weekly(VARIABLE_TO_PLOT, WEEKS_TO_PLOT)
+    if fig is not None:
+        fig.savefig("weekly_variable_plot.png", dpi=150)
+        print("Saved weekly_variable_plot.png")
+        plt.show()
