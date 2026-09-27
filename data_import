@@ -113,6 +113,34 @@ readings_col = readings_col.loc[~bad].reset_index(drop=True)
 records = readings_col.map(_flatten)
 wide = pd.DataFrame(records.tolist())
 
+# ------------------------------------------------------------------
+# 3b. Drop exact duplicate readings: identical reading time AND an
+#     identical value for every variable. This is a genuine data
+#     issue, confirmed in this file -- e.g. row ids 2, 4, and 38 all
+#     have time=1702273965 and Carbon dioxide=603 (and every other
+#     variable matching too). The same physical reading was logged
+#     three times under three different database row ids.
+#
+#     Left in, each duplicate group re-plots the exact same y-value
+#     at a different x-position (different createdate). If this
+#     duplication happens repeatedly throughout a larger file -- the
+#     same reading re-logged every so often -- those fixed values
+#     keep reappearing at many different times across the whole date
+#     range. On a time-series plot that looks like a flat horizontal
+#     "band" running continuously across the graph, when it's
+#     actually many discrete duplicate points lined up at the same
+#     height, not one real continuous signal.
+#
+#     keep="first" is safe here specifically because duplication is
+#     checked across EVERY variable column plus the reading time --
+#     two rows are only dropped as duplicates if literally everything
+#     matches. Two genuinely different readings that happen to share
+#     a timestamp, but differ in value, are NOT touched by this.
+# ------------------------------------------------------------------
+dup_mask = wide.duplicated(keep="first")
+raw = raw.loc[~dup_mask].reset_index(drop=True)
+wide = wide.loc[~dup_mask].reset_index(drop=True)
+
 # Guarantee every expected variable is present as a column (missing
 # ones become all-NaN) in a single vectorized reindex, rather than a
 # per-variable .get()/fallback loop.
@@ -154,13 +182,3 @@ pm1 = wide_vars["Particulate matter 1"].to_numpy(dtype=float)
 pm4 = wide_vars["Particulate matter 4"].to_numpy(dtype=float)
 pm25 = wide_vars["Particulate matter 2.5"].to_numpy(dtype=float)
 pm10 = wide_vars["Particulate matter 10"].to_numpy(dtype=float)
-
-if __name__ == "__main__":
-    print(f"Loaded {len(row_ids)} rows")
-    print("row_ids:     ", row_ids)
-    print("timestamps:  ", timestamps[:3], "...")
-    print("created_at:  ", created_at[:3], "...")
-    print("co2:         ", co2)
-    print("temperature: ", temperature)
-    print("humidity:    ", humidity)
-    print("pressure:    ", pressure)
