@@ -1,0 +1,305 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Sep 29 19:02:38 2026
+
+@author: myjla
+"""
+
+"""
+Predict future trends with Support Vector Regression or Neural Network Regression
+========================================================================
+Fits a nonlinear regression model to one environmental variable over
+time, then:
+  1. Evaluates it against held-out TEST weeks and plots predicted vs.
+     true values, so you can see exactly how well it generalizes.
+  2. Uses the trained model to forecast the variable into the future,
+     beyond the last observed reading.
+
+EFFICIENCY, for ~150,000 points:
+  A plain kernel SVR (sklearn.svm.SVR) trains in O(n^2) to O(n^3) time
+  -- utterly impractical at this scale (150,000^2 is 22.5 billion).
+  "svr" mode here instead uses a Nystroem kernel approximation, which
+  projects the data into a fixed-size approximate feature space in
+  roughly O(n) time, then fits a fast LinearSVR on that -- this keeps
+  the nonlinear, "support-vector" character of the model while scaling
+  to large n. "neural_network" mode uses a small MLP trained with
+  mini-batch Adam, which also scales comfortably to this size.
+
+FEATURES: rather than a single "seconds since start" input, the model
+also gets sin/cos encodings of hour-of-day and day-of-week. A plain
+time-only model (as the spline in fit_spline.py demonstrated) captures
+a slow trend but completely misses daily/weekly cycles -- which most
+environmental variables have (occupancy-driven CO2, diurnal
+temperature). These cyclical features can be computed for ANY future
+timestamp too, so the forecast can extend real seasonality forward,
+not just a flat trend line.
+
+Built directly on import_sensor_csv.py, weekly_grouping.py, and
+visualize_weekly.py (reuses AVAILABLE_VARIABLES, number_weeks, _thin)
+-- no changes needed to any of them. This file is fully self-contained
+otherwise: it does not import from or depend on fit_spline.py.
+
+Change the settings below, then run this script:
+
+    VARIABLE_TO_PREDICT
+    MODEL_TYPE            -- "svr" or "neural_network"
+    TRAIN_WEEKS / TEST_WEEKS
+    FUTURE_HORIZON_DAYS    -- how far past the last reading to forecast
+========================================================================
+"""
+
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.kernel_approximation import Nystroem
+from sklearn.neural_network import MLPRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVR
+
+from MMA3001_Data_Analysis import row_ids, created_at
+from weekly_groupings import group_by_week
+from data_visualisation import AVAILABLE_VARIABLES, number_weeks, print_available_weeks, _thin
+
+# ------------------------------------------------------------------
+# Human-changeable settings
+# ------------------------------------------------------------------
+VARIABLE_TO_PREDICT = "co2"        # <- a key from AVAILABLE_VARIABLES
+
+MODEL_TYPE = "neural_network"      # <- "svr" or "neural_network"
+
+TRAIN_WEEKS = "all_except_holdout" # <- or a list of week numbers, e.g. [1, 2, 3]
+TEST_WEEKS = "last"                # <- "last", a week number, or a list of week numbers
+
+FUTURE_HORIZON_DAYS = 7            # forecast this many days past the last observed reading
+FUTURE_POINTS = 200                # resolution of the forecast curve
+
+PLOT_MAX_POINTS = 2000             # thin scatter points for plotting only (training uses all data)
+
+# --- svr mode settings (Nystroem-approximated kernel SVR) ---
+SVR_N_COMPONENTS = 200   # more = closer to a true kernel SVR, but slower/more memory
+SVR_GAMMA = None         # None lets sklearn pick a default (1 / n_features)
+SVR_C = 1.0              # regularization strength -- larger fits training data more closely
+SVR_EPSILON = 0.1
+
+# --- neural_network mode settings ---
+NN_HIDDEN_LAYERS = (64, 32)
+NN_MAX_ITER = 500
+NN_EARLY_STOPPING = True
+# ------------------------------------------------------------------
+
+
+def _resolve_weeks(weeks_spec, week_numbers):
+    """'all', 'last', a week number, or a list of week numbers/dates -> list of week-start Timestamps."""
+    if weeks_spec is None:
+        return []
+    if isinstance(weeks_spec, str) and weeks_spec == "all":
+        return sorted(week_numbers.values())
+    if isinstance(weeks_spec, str) and weeks_spec == "last":
+        return [week_numbers[max(week_numbers)]] if week_numbers else []
+    items = [weeks_spec] if isinstance(weeks_spec, (int, str, pd.Timestamp)) else list(weeks_spec)
+    resolved = []
+    for item in items:
+        if isinstance(item, int):
+            if item in week_numbers:
+                resolved.append(week_numbers[item])
+            else:
+                print(f"[warning] week number {item} not found")
+        else:
+            ts = pd.Timestamp(item)
+            if ts in week_numbers.values():
+                resolved.append(ts)
+            else:
+                print(f"[warning] week {item} not found")
+    return resolved
+
+
+def _collect(weekly_groups, weeks):
+    """Concatenates (created_at, value) rows for the given weeks: sorted, NaN-dropped, de-duplicated on created_at."""
+    parts = [weekly_groups[w] for w in weeks if w in weekly_groups]
+    if not parts:
+        return pd.DataFrame(columns=["created_at", "value"])
+    combined = pd.concat(parts, ignore_index=True).dropna(subset=["value"]).sort_values("created_at")
+    return combined.drop_duplicates(subset="created_at", keep="first")
+
+
+def _to_seconds(timestamps, t0):
+    return (timestamps - t0).dt.total_seconds().to_numpy()
+
+
+def _error_metrics(y_true, y_pred):
+    residuals = y_true - y_pred
+    rmse = np.sqrt(np.mean(residuals ** 2))
+    mae = np.mean(np.abs(residuals))
+    ss_res = np.sum(residuals ** 2)
+    ss_tot = np.sum((y_true - y_true.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return {"rmse": rmse, "mae": mae, "r2": r2}
+
+
+def _build_features(timestamps, t0):
+    """
+    Turns a Series of timestamps into a feature matrix: elapsed time
+    (captures the long-term trend) plus sin/cos encodings of
+    hour-of-day and day-of-week (captures daily/weekly cycles). These
+    cyclical features are well-defined for future timestamps too, so
+    a forecast can carry real seasonality forward.
+    """
+    t_seconds = _to_seconds(timestamps, t0)
+    hour = timestamps.dt.hour + timestamps.dt.minute / 60
+    dow = timestamps.dt.dayofweek + hour / 24
+    return np.column_stack([
+        t_seconds,
+        np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24),
+        np.sin(2 * np.pi * dow / 7), np.cos(2 * np.pi * dow / 7),
+    ])
+
+
+def build_model(model_type):
+    if model_type == "svr":
+        return make_pipeline(
+            StandardScaler(),
+            Nystroem(kernel="rbf", gamma=SVR_GAMMA, n_components=SVR_N_COMPONENTS, random_state=0),
+            LinearSVR(C=SVR_C, epsilon=SVR_EPSILON, max_iter=10000),
+        )
+    if model_type == "neural_network":
+        return make_pipeline(
+            StandardScaler(),
+            MLPRegressor(hidden_layer_sizes=NN_HIDDEN_LAYERS, max_iter=NN_MAX_ITER,
+                         early_stopping=NN_EARLY_STOPPING, random_state=0),
+        )
+    raise ValueError(f"Unknown MODEL_TYPE '{model_type}', choose 'svr' or 'neural_network'")
+
+
+def fit_and_forecast(variable_key, model_type=MODEL_TYPE, train_weeks=TRAIN_WEEKS,
+                      test_weeks=TEST_WEEKS, future_horizon_days=FUTURE_HORIZON_DAYS):
+    """
+    Fits `model_type` on the training weeks, evaluates on the test
+    weeks, and forecasts `future_horizon_days` beyond the last observed
+    reading. Returns a results dict (used by plot_forecast), or None
+    if there wasn't enough training data.
+    """
+    if variable_key not in AVAILABLE_VARIABLES:
+        raise ValueError(f"Unknown variable '{variable_key}'. Choose from: {list(AVAILABLE_VARIABLES)}")
+    values, display_name, unit = AVAILABLE_VARIABLES[variable_key]
+
+    weekly_groups, _ = group_by_week(created_at, row_id=row_ids, value=values)
+    week_numbers = number_weeks(weekly_groups)
+
+    test_week_starts = _resolve_weeks(test_weeks, week_numbers)
+    if train_weeks == "all_except_holdout":
+        train_week_starts = [w for w in sorted(week_numbers.values()) if w not in test_week_starts]
+    else:
+        candidate = _resolve_weeks(train_weeks, week_numbers)
+        overlap = [w for w in candidate if w in test_week_starts]
+        if overlap:
+            print(f"[warning] {display_name}: {len(overlap)} week(s) requested for both training "
+                  f"and test -- removing from training to avoid leakage.")
+        train_week_starts = [w for w in candidate if w not in test_week_starts]
+
+    train_data = _collect(weekly_groups, train_week_starts)
+    test_data = _collect(weekly_groups, test_week_starts)
+
+    if len(train_data) == 0:
+        print(f"[error] {display_name}: no training data available -- check TRAIN_WEEKS/TEST_WEEKS")
+        return None
+
+    t0 = train_data["created_at"].min()
+    X_train = _build_features(train_data["created_at"], t0)
+    y_train = train_data["value"].to_numpy()
+
+    model = build_model(model_type)
+    t_fit0 = time.perf_counter()
+    model.fit(X_train, y_train)
+    fit_seconds = time.perf_counter() - t_fit0
+    print(f"{display_name}: fitted {model_type} on {len(X_train)} point(s) in {fit_seconds:.2f}s")
+
+    results = {
+        "variable_key": variable_key, "display_name": display_name, "unit": unit,
+        "model": model, "model_type": model_type, "t0": t0,
+        "train_data": train_data, "test_data": test_data,
+    }
+
+    if len(test_data) > 0:
+        X_test = _build_features(test_data["created_at"], t0)
+        y_test = test_data["value"].to_numpy()
+        y_pred = model.predict(X_test)
+        metrics = _error_metrics(y_test, y_pred)
+        results.update(test_pred=y_pred, **metrics)
+        r2_str = "n/a" if np.isnan(metrics["r2"]) else f"{metrics['r2']:.3f}"
+        print(f"{display_name}: TEST results ({len(test_data)} point(s)) -- "
+              f"RMSE {metrics['rmse']:.3f} {unit}, MAE {metrics['mae']:.3f} {unit}, R^2 {r2_str}")
+    else:
+        print(f"[warning] {display_name}: no test data available -- check TEST_WEEKS")
+
+    last_time = pd.concat([train_data["created_at"], test_data["created_at"]]).max()
+    future_times = pd.Series(pd.date_range(last_time, last_time + pd.Timedelta(days=future_horizon_days),
+                                            periods=FUTURE_POINTS))
+    X_future = _build_features(future_times, t0)
+    results.update(future_times=future_times, y_future=model.predict(X_future), last_observed=last_time)
+
+    return results
+
+
+def plot_forecast(results):
+    """
+    Two panels: (left) the time series with training data, test data,
+    the model's fitted curve, and the forecast extending into the
+    future; (right) predicted vs. true value for the test set -- the
+    standard diagnostic for how good a regression's predictions are.
+    """
+    if results is None:
+        return None
+    train_data, test_data = results["train_data"], results["test_data"]
+    model, t0 = results["model"], results["t0"]
+    display_name, unit = results["display_name"], results["unit"]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5.5), gridspec_kw={"width_ratios": [2, 1]})
+
+    train_plot = _thin(train_data, PLOT_MAX_POINTS)
+    ax1.scatter(train_plot["created_at"], train_plot["value"], s=20, alpha=0.5, label="Training data")
+    if len(test_data):
+        test_plot = _thin(test_data, PLOT_MAX_POINTS)
+        ax1.scatter(test_plot["created_at"], test_plot["value"], s=20, alpha=0.7,
+                   color="crimson", marker="s", label="Test data (held out)")
+
+    observed = pd.concat([train_data["created_at"], test_data["created_at"]], ignore_index=True)
+    t_smooth = pd.Series(pd.date_range(observed.min(), observed.max(), periods=400))
+    y_smooth = model.predict(_build_features(t_smooth, t0))
+    ax1.plot(t_smooth, y_smooth, color="seagreen", linewidth=2, label="Model fit")
+    ax1.plot(results["future_times"], results["y_future"], "--", color="darkorange", linewidth=2,
+             label=f"Forecast (+{FUTURE_HORIZON_DAYS}d)")
+    ax1.axvline(results["last_observed"], color="gray", linestyle=":", linewidth=1)
+
+    ax1.set_title(f"{display_name} -- {results['model_type']}")
+    ax1.set_xlabel("Created At")
+    ax1.set_ylabel(f"{display_name} ({unit})")
+    ax1.grid(True, alpha=0.3, linestyle="--")
+    ax1.legend(fontsize=9)
+    ax1.tick_params(axis="x", rotation=30)
+
+    if "test_pred" in results:
+        y_test = test_data["value"].to_numpy()
+        y_pred = results["test_pred"]
+        lims = [min(y_test.min(), y_pred.min()), max(y_test.max(), y_pred.max())]
+        ax2.plot(lims, lims, "k--", linewidth=1, label="Perfect prediction")
+        ax2.scatter(y_test, y_pred, s=20, alpha=0.5, color="crimson")
+        ax2.set_xlabel(f"True {display_name} ({unit})")
+        ax2.set_ylabel(f"Predicted {display_name} ({unit})")
+        ax2.set_title(f"Test set: R\u00b2={results['r2']:.3f}, RMSE={results['rmse']:.2f}")
+        ax2.grid(True, alpha=0.3, linestyle="--")
+        ax2.legend(fontsize=9)
+    else:
+        ax2.text(0.5, 0.5, "No test data", ha="center", va="center", transform=ax2.transAxes)
+
+    fig.tight_layout()
+    return fig
+
+
+if __name__ == "__main__":
+    results = fit_and_forecast(VARIABLE_TO_PREDICT)
+    fig = plot_forecast(results)
+    if fig is not None:
+        plt.show()
