@@ -1,0 +1,429 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Oct  1 22:15:07 2026
+
+@author: myjla
+"""
+
+"""
+Evaluate an ensemble of per-week Neural Network trials against a test week
+========================================================================
+Trains a SEPARATE neural network "trial" on EACH individual training
+week (never pooling weeks together), then COMBINES all trials into one
+prediction by averaging their outputs -- a weighted ensemble, not a
+single model. The ensemble is evaluated ONLY at TEST_WEEKS' own
+timestamps -- real, known readings -- rather than extrapolating into
+an unobserved future with no ground truth to check it against.
+
+Earlier versions of this script tried extending the ensemble into an
+open-ended future beyond all observed data. That was dropped: there's
+no ground truth out there to confirm or deny the forecast, so "looks
+plausible" was the only available check, which isn't a real validation.
+Scoring against a genuine held-out test week is a strictly stronger and
+more honest test of the same underlying question -- can a model trained
+on other weeks predict a week it never saw?
+
+WHY AN ENSEMBLE OF PER-WEEK TRIALS: a single model trained on one week
+and asked to predict a different week performs worse the further away
+that week is (confirmed empirically in this project's earlier per-week
+work) -- extrapolation error grows with distance. An ensemble doesn't
+avoid that, but it means the result isn't riding on any one week's
+potentially-unlucky fit, and trials from weeks closer to the test week
+can be weighted more heavily than trials from weeks further away
+(RECENCY_WEIGHTING below).
+
+A SECOND problem showed up during testing, independent of distance: a
+neural network extrapolating past its training domain can diverge
+wildly, not just get noisier -- confirmed empirically, where even the
+single CLOSEST trial predicted 954 for a point whose true value was
+~400. Recency weighting alone didn't fix this (it down-weights distant
+trials, it doesn't bound a nearby trial's bad prediction), so every
+trial's output is also clipped to a sane GLOBAL range (observed across
+all trials combined, with a modest buffer) before being combined.
+
+TEST AND VALIDATION, at two levels:
+  1. Per-trial: each trial's own MLPRegressor uses scikit-learn's
+     built-in early_stopping, which internally holds out a random
+     fraction of that week's own points to decide when to stop
+     training -- a validation sample within each trial.
+  2. Ensemble-level: VALIDATION_WEEKS are never used to train any
+     trial; they're used only to tune RECENCY_DECAY (how much to
+     down-weight distant trials) via a small grid search. TEST_WEEKS
+     are never used for training OR tuning -- only to report final,
+     honest performance of the combined ensemble.
+
+FEATURES: each trial gets elapsed time (within its own week) plus
+sin/cos encodings of hour-of-day and day-of-week, so it can separate
+the daily/weekly cycle from the slower trend within its own week.
+
+Built directly on import_sensor_csv.py, weekly_grouping.py, and
+visualize_weekly.py (reuses AVAILABLE_VARIABLES, number_weeks, _thin)
+-- no changes needed to any of them, and no dependency on fit_spline.py,
+predict_trends.py, or weekly_trends.py.
+
+Change the settings below, then run this script:
+
+    VARIABLE_TO_PREDICT
+    TRIAL_WEEKS           -- each of these weeks trains its own independent trial
+    VALIDATION_WEEKS      -- held out, used only to tune the recency weighting
+    TEST_WEEKS            -- held out, used only for final honest evaluation
+    MIN_POINTS_PER_WEEK
+    RECENCY_WEIGHTING     -- "auto" tunes decay via VALIDATION_WEEKS, or a fixed number, or None for equal weights
+========================================================================
+"""
+
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.neural_network import MLPRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+from data_import import row_ids, created_at
+from weekly_groupings import group_by_week
+from data_visualisation import AVAILABLE_VARIABLES, number_weeks, print_available_weeks, _thin
+
+# ------------------------------------------------------------------
+# Human-changeable settings
+# ------------------------------------------------------------------
+VARIABLE_TO_PREDICT = "co2"        # <- a key from AVAILABLE_VARIABLES
+
+TRIAL_WEEKS = [1,2,3,4,5,6,7.8,9,10] # <- each of these weeks trains its OWN independent NN trial
+VALIDATION_WEEKS = [11]             # <- held out from training; used only to tune recency weighting
+TEST_WEEKS = "last"                # <- held out from training AND tuning; final honest evaluation
+MIN_POINTS_PER_WEEK = 10
+
+RECENCY_WEIGHTING = "auto"         # "auto" tunes the decay rate via VALIDATION_WEEKS;
+                                    # a fixed number (0 = equal weights, larger = faster down-weighting
+                                    # of trials far from the forecast target); or None for equal weights
+PLOT_MAX_POINTS = 2000             # thin scatter points for plotting only (training uses all data)
+
+# --- neural_network trial settings ---
+NN_HIDDEN_LAYERS = (64, 32)
+NN_MAX_ITER = 500
+NN_EARLY_STOPPING = True           # scikit-learn's own internal train/validation split per trial
+NN_VALIDATION_FRACTION = 0.1
+RANDOM_SEED = 0
+# ------------------------------------------------------------------
+
+
+def _resolve_weeks(weeks_spec, week_numbers):
+    """'all', 'last', a week number, or a list of week numbers/dates -> list of week-start Timestamps."""
+    if weeks_spec is None:
+        return []
+    if isinstance(weeks_spec, str) and weeks_spec == "all":
+        return sorted(week_numbers.values())
+    if isinstance(weeks_spec, str) and weeks_spec == "last":
+        return [week_numbers[max(week_numbers)]] if week_numbers else []
+    items = [weeks_spec] if isinstance(weeks_spec, (int, str, pd.Timestamp)) else list(weeks_spec)
+    resolved = []
+    for item in items:
+        if isinstance(item, int):
+            if item in week_numbers:
+                resolved.append(week_numbers[item])
+            else:
+                print(f"[warning] week number {item} not found")
+        else:
+            ts = pd.Timestamp(item)
+            if ts in week_numbers.values():
+                resolved.append(ts)
+            else:
+                print(f"[warning] week {item} not found")
+    return resolved
+
+
+def _collect(weekly_groups, weeks):
+    """Concatenates (timestamp, value) rows for the given weeks: sorted, NaN-dropped, de-duplicated on timestamp."""
+    parts = [weekly_groups[w] for w in weeks if w in weekly_groups]
+    if not parts:
+        return pd.DataFrame(columns=["created_at", "value"])
+    combined = pd.concat(parts, ignore_index=True).dropna(subset=["value"]).sort_values("created_at")
+    return combined.drop_duplicates(subset="created_at", keep="first")
+
+
+def _to_seconds(timestamps, t0):
+    return (timestamps - t0).dt.total_seconds().to_numpy()
+
+
+def _error_metrics(y_true, y_pred):
+    residuals = y_true - y_pred
+    rmse = np.sqrt(np.mean(residuals ** 2))
+    mae = np.mean(np.abs(residuals))
+    ss_res = np.sum(residuals ** 2)
+    ss_tot = np.sum((y_true - y_true.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return {"rmse": rmse, "mae": mae, "r2": r2}
+
+
+def _build_features(timestamps, t0):
+    """Elapsed time (relative to t0) plus sin/cos hour-of-day and day-of-week."""
+    t_seconds = _to_seconds(timestamps, t0)
+    hour = timestamps.dt.hour + timestamps.dt.minute / 60
+    dow = timestamps.dt.dayofweek + hour / 24
+    return np.column_stack([
+        t_seconds,
+        np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24),
+        np.sin(2 * np.pi * dow / 7), np.cos(2 * np.pi * dow / 7),
+    ])
+
+
+def build_trial_model(random_state):
+    return make_pipeline(
+        StandardScaler(),
+        MLPRegressor(hidden_layer_sizes=NN_HIDDEN_LAYERS, max_iter=NN_MAX_ITER,
+                     early_stopping=NN_EARLY_STOPPING, validation_fraction=NN_VALIDATION_FRACTION,
+                     random_state=random_state),
+    )
+
+
+def train_trials(variable_key, trial_weeks=TRIAL_WEEKS, validation_weeks=VALIDATION_WEEKS,
+                  test_weeks=TEST_WEEKS, min_points_per_week=MIN_POINTS_PER_WEEK):
+    """
+    Trains one independent NN trial per trial week. Returns
+    (trials, validation_data, test_data, display_name, unit) where
+    trials is a list of dicts: {week_start, week_number, model, t0, week_data}.
+    """
+    if variable_key not in AVAILABLE_VARIABLES:
+        raise ValueError(f"Unknown variable '{variable_key}'. Choose from: {list(AVAILABLE_VARIABLES)}")
+    values, display_name, unit = AVAILABLE_VARIABLES[variable_key]
+
+    weekly_groups, _ = group_by_week(created_at, row_id=row_ids, value=values)
+    week_numbers = number_weeks(weekly_groups)
+
+    validation_week_starts = _resolve_weeks(validation_weeks, week_numbers)
+    test_week_starts = _resolve_weeks(test_weeks, week_numbers)
+    holdout = set(validation_week_starts) | set(test_week_starts)
+
+    if trial_weeks == "all_except_holdout":
+        trial_week_starts = [w for w in sorted(week_numbers.values()) if w not in holdout]
+    else:
+        candidate = _resolve_weeks(trial_weeks, week_numbers)
+        overlap = [w for w in candidate if w in holdout]
+        if overlap:
+            print(f"[warning] {display_name}: {len(overlap)} week(s) requested as trials also "
+                  f"appear in validation/test -- removing from trials to avoid leakage.")
+        trial_week_starts = [w for w in candidate if w not in holdout]
+
+    validation_data = _collect(weekly_groups, validation_week_starts)
+    test_data = _collect(weekly_groups, test_week_starts)
+
+    trials = []
+    for i, week_start in enumerate(trial_week_starts):
+        week_number = next(n for n, w in week_numbers.items() if w == week_start)
+        week_data = _collect(weekly_groups, [week_start])
+
+        if len(week_data) < min_points_per_week:
+            print(f"[skip] {display_name}: week {week_number} ({week_start.date()}) has only "
+                  f"{len(week_data)} point(s), need at least {min_points_per_week} -- skipping trial.")
+            continue
+
+        t0 = week_data["created_at"].min()
+        X_train = _build_features(week_data["created_at"], t0)
+        y_train = week_data["value"].to_numpy()
+
+        model = build_trial_model(random_state=RANDOM_SEED + i)
+        try:
+            t_fit0 = time.perf_counter()
+            model.fit(X_train, y_train)
+            fit_seconds = time.perf_counter() - t_fit0
+        except Exception as e:
+            print(f"[skip] {display_name}: week {week_number} ({week_start.date()}) trial failed to "
+                  f"fit ({e}) -- skipping.")
+            continue
+
+        print(f"{display_name}: trial for week {week_number} ({week_start.date()}) -- "
+              f"{len(week_data)} point(s), fitted in {fit_seconds:.2f}s")
+        y_train_vals = week_data["value"].to_numpy()
+        trials.append({"week_start": week_start, "week_number": week_number, "model": model,
+                       "t0": t0, "week_data": week_data,
+                       "y_min": y_train_vals.min(), "y_max": y_train_vals.max()})
+
+    if not trials:
+        print(f"[error] {display_name}: no trials were trained -- check TRIAL_WEEKS/MIN_POINTS_PER_WEEK.")
+
+    return trials, validation_data, test_data, display_name, unit
+
+
+def _trial_weights(trials, target_time, decay):
+    """
+    Weight for each trial = exp(-decay * weeks_between(trial week, target_time)).
+    decay=0 gives equal weights; larger decay down-weights trials whose
+    training week is further from the time being predicted.
+    """
+    weeks_away = np.array([abs((target_time - t["week_data"]["created_at"].max()).total_seconds())
+                           / (7 * 86400) for t in trials])
+    raw = np.exp(-decay * weeks_away)
+    return raw / raw.sum()
+
+
+def combine_predict(trials, target_times, decay, global_bounds=None):
+    """
+    Each trial predicts at target_times (using ITS OWN t0 for the elapsed-
+    time feature -- this is extrapolation for trials far from target_times,
+    by design; that's exactly why distant trials get down-weighted).
+
+    CLIPPING TO A GLOBAL SANE RANGE: a neural network extrapolating past
+    its training domain doesn't just get noisier -- it can diverge wildly,
+    and this isn't limited to distant trials. Confirmed empirically: even
+    the CLOSEST trial (one week away) predicted 954 ppm for a point whose
+    true value was ~400 ppm, while real readings across the whole dataset
+    never exceed ~560 ppm. A plausibility bound based on each trial's OWN
+    training range was tried first and wasn't tight enough -- a trial with
+    a wide observed range gets a proportionally wide allowance, which
+    still let a badly-diverged-but-not-astronomical prediction like 954
+    through. Clipping every trial's prediction to a GLOBAL sane range
+    (observed across ALL trials combined, with a modest buffer) is a
+    simpler, much stronger safeguard: it bounds every contribution to a
+    physically plausible value regardless of which trial produced it or
+    how wide that trial's own range happened to be.
+
+    Returns the weighted-average prediction and the individual (clipped)
+    trial predictions, for plotting spread.
+    """
+    target_times = pd.Series(pd.DatetimeIndex(target_times))
+    raw_preds = np.column_stack([
+        t["model"].predict(_build_features(target_times, t["t0"])) for t in trials
+    ])
+
+    if global_bounds is not None:
+        lo, hi = global_bounds
+        per_trial_preds = np.clip(raw_preds, lo, hi)
+    else:
+        per_trial_preds = raw_preds
+
+    combined = np.empty(len(target_times))
+    for i, target_time in enumerate(target_times):
+        w = _trial_weights(trials, target_time, decay)
+        combined[i] = np.dot(per_trial_preds[i], w)
+    return combined, per_trial_preds
+
+
+def _global_bounds(trials, buffer_fraction=0.25):
+    """Sane prediction range from ALL trials' combined observed data, with a modest buffer either side."""
+    all_values = pd.concat([t["week_data"]["value"] for t in trials], ignore_index=True)
+    lo, hi = all_values.min(), all_values.max()
+    buffer = (hi - lo) * buffer_fraction
+    return lo - buffer, hi + buffer
+
+
+def tune_recency_decay(trials, validation_data, global_bounds, candidates=(0, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0)):
+    """Grid-searches the recency decay rate using validation_data, if any is available."""
+    if len(validation_data) == 0:
+        print("[warning] RECENCY_WEIGHTING='auto' but no validation data -- using equal weights (decay=0).")
+        return 0.0, None
+    best_decay, best_rmse = 0.0, np.inf
+    for decay in candidates:
+        pred, _ = combine_predict(trials, validation_data["created_at"], decay, global_bounds)
+        rmse = np.sqrt(np.mean((validation_data["value"].to_numpy() - pred) ** 2))
+        if rmse < best_rmse:
+            best_decay, best_rmse = decay, rmse
+    print(f"Tuned recency decay={best_decay:g} using {len(validation_data)} validation point(s) "
+          f"(validation RMSE {best_rmse:.3f})")
+    return best_decay, best_rmse
+
+
+def evaluate_ensemble(variable_key=VARIABLE_TO_PREDICT, recency_weighting=RECENCY_WEIGHTING):
+    """
+    Full pipeline: train trials, tune (or fix) the recency decay, and
+    evaluate the combined ensemble AT TEST_WEEKS' own timestamps --
+    real, known data, not an extrapolation into an unobserved future.
+    Returns a results dict for plot_ensemble_evaluation, or None if
+    there was nothing to evaluate.
+    """
+    trials, validation_data, test_data, display_name, unit = train_trials(variable_key)
+    if not trials:
+        return None
+    if len(test_data) == 0:
+        print(f"[error] {display_name}: no test data available -- check TEST_WEEKS. "
+              f"Nothing to evaluate the ensemble against.")
+        return None
+
+    global_bounds = _global_bounds(trials)
+    print(f"{display_name}: clipping extrapolated predictions to "
+          f"[{global_bounds[0]:.1f}, {global_bounds[1]:.1f}] {unit}")
+
+    if recency_weighting == "auto":
+        decay, _ = tune_recency_decay(trials, validation_data, global_bounds)
+    elif recency_weighting is None:
+        decay = 0.0
+    else:
+        decay = float(recency_weighting)
+
+    y_pred, per_trial_pred = combine_predict(trials, test_data["created_at"], decay, global_bounds)
+    y_true = test_data["value"].to_numpy()
+    metrics = _error_metrics(y_true, y_pred)
+    r2_str = "n/a" if np.isnan(metrics["r2"]) else f"{metrics['r2']:.3f}"
+    print(f"{display_name}: ensemble evaluated on TEST week(s) ({len(test_data)} point(s)) -- "
+          f"RMSE {metrics['rmse']:.3f} {unit}, MAE {metrics['mae']:.3f} {unit}, R^2 {r2_str}")
+
+    return {
+        "variable_key": variable_key, "display_name": display_name, "unit": unit,
+        "trials": trials, "validation_data": validation_data, "test_data": test_data, "decay": decay,
+        "test_pred": y_pred, "per_trial_pred": per_trial_pred, **metrics,
+    }
+
+
+def plot_ensemble_evaluation(results):
+    """
+    Two panels: (left) the test week's true data plotted directly
+    against the ensemble's prediction AT THOSE SAME TIMESTAMPS -- both
+    as a time series, so you can see where they track and where they
+    diverge, with faint individual-trial predictions for context; (right)
+    predicted vs. true scatter for the test week, the standard regression
+    diagnostic.
+    """
+    if results is None:
+        return None
+    trials, test_data = results["trials"], results["test_data"]
+    display_name, unit = results["display_name"], results["unit"]
+    y_pred, per_trial_pred = results["test_pred"], results["per_trial_pred"]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5.5), gridspec_kw={"width_ratios": [2, 1]})
+
+    order = np.argsort(test_data["created_at"].to_numpy())
+    times_sorted = test_data["created_at"].to_numpy()[order]
+    y_true_sorted = test_data["value"].to_numpy()[order]
+    y_pred_sorted = y_pred[order]
+
+    for i in range(per_trial_pred.shape[1]):
+        ax1.plot(times_sorted, per_trial_pred[order, i], color="gray", alpha=0.2, linewidth=1,
+                 label="Individual trial predictions" if i == 0 else None)
+
+    thin_idx = np.linspace(0, len(times_sorted) - 1, min(PLOT_MAX_POINTS, len(times_sorted))).astype(int)
+    ax1.scatter(times_sorted[thin_idx], y_true_sorted[thin_idx], s=20, alpha=0.6,
+               color="crimson", marker="s", label="True test data")
+    ax1.plot(times_sorted, y_pred_sorted, color="darkorange", linewidth=2.5,
+             label=f"Combined ensemble prediction (decay={results['decay']:g})")
+
+    ax1.set_title(f"{display_name} -- ensemble of {len(trials)} per-week NN trials, "
+                  f"evaluated on the test week")
+    ax1.set_xlabel("Created At")
+    ax1.set_ylabel(f"{display_name} ({unit})")
+    ax1.grid(True, alpha=0.3, linestyle="--")
+    ax1.legend(fontsize=8)
+    ax1.tick_params(axis="x", rotation=30)
+
+    y_true = test_data["value"].to_numpy()
+    lims = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
+    ax2.plot(lims, lims, "k--", linewidth=1, label="Perfect prediction")
+    ax2.scatter(y_true, y_pred, s=20, alpha=0.5, color="crimson")
+    ax2.set_xlabel(f"True {display_name} ({unit})")
+    ax2.set_ylabel(f"Predicted {display_name} ({unit})")
+    ax2.set_title(f"Test set: R\u00b2={results['r2']:.3f}, RMSE={results['rmse']:.2f}")
+    ax2.grid(True, alpha=0.3, linestyle="--")
+    ax2.legend(fontsize=9)
+
+    fig.tight_layout()
+    return fig
+
+
+if __name__ == "__main__":
+    print_available_weeks(number_weeks(group_by_week(created_at)[0]))
+    print()
+
+    results = evaluate_ensemble()
+    fig = plot_ensemble_evaluation(results)
+    if fig is not None:
+        plt.show()
