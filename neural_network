@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Oct  1 22:15:07 2026
-
-@author: myjla
-"""
-
 """
 Incrementally train one Neural Network across multiple weeks, evaluated on a test week
 ========================================================================
@@ -77,9 +70,9 @@ from data_visualisation import AVAILABLE_VARIABLES, number_weeks, print_availabl
 # ------------------------------------------------------------------
 VARIABLE_TO_PREDICT = "co2"        # <- a key from AVAILABLE_VARIABLES
 
-TRIAL_WEEKS = "all_except_holdout" # <- processed in chronological order; each updates the shared weights
-VALIDATION_WEEKS = [2]             # <- held out from training; used only to monitor progress across weeks
-TEST_WEEKS = "last"                # <- held out from training; final honest evaluation
+TRIAL_WEEKS = [1,2,3,4,5,6,7,8,9] # <- processed in chronological order; each updates the shared weights
+VALIDATION_WEEKS = [10]             # <- held out from training; used only to monitor progress across weeks
+TEST_WEEKS = [11]                # <- held out from training; final honest evaluation
 MIN_POINTS_PER_WEEK = 10
 
 EPOCHS_PER_WEEK = 50                # partial_fit passes over each week's data before moving to the next
@@ -302,6 +295,38 @@ def plot_incremental_evaluation(results):
     fig.tight_layout()
     return fig
 
+def plot_test_week_only(results):
+    """
+    A single focused plot: ONLY the test week -- true data vs. the
+    model's prediction at those same timestamps -- with no training
+    data in the background and no thinning, so the comparison itself
+    isn't competing for attention with anything else.
+    """
+    if results is None or "test_pred" not in results:
+        return None
+    test_data = results["test_data"]
+    display_name, unit = results["display_name"], results["unit"]
+    y_pred = results["test_pred"]
+ 
+    order = np.argsort(test_data["created_at"].to_numpy())
+    times_sorted = test_data["created_at"].to_numpy()[order]
+    y_true_sorted = test_data["value"].to_numpy()[order]
+    y_pred_sorted = y_pred[order]
+ 
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.scatter(times_sorted, y_true_sorted, s=15, alpha=0.6, color="crimson",
+              marker="s", label="True test data")
+    ax.plot(times_sorted, y_pred_sorted, color="darkorange", linewidth=2.5, label="Model prediction")
+ 
+    ax.set_title(f"{display_name} -- test week only: true vs. predicted "
+                 f"(R\u00b2={results['r2']:.3f}, RMSE={results['rmse']:.2f} {unit})")
+    ax.set_xlabel("Created At")
+    ax.set_ylabel(f"{display_name} ({unit})")
+    ax.grid(True, alpha=0.3, linestyle="--")
+    ax.legend(fontsize=9)
+    ax.tick_params(axis="x", rotation=30)
+    fig.tight_layout()
+    return fig
 
 def plot_validation_progress(results):
     """Shows how validation RMSE/R^2 evolved as each successive week's data updated the shared weights."""
@@ -331,6 +356,7 @@ if __name__ == "__main__":
     results = train_incremental(VARIABLE_TO_PREDICT)
     if results is not None:
         plot_validation_progress(results)
-        fig = plot_incremental_evaluation(results)
+        plot_incremental_evaluation(results)
+        fig = plot_test_week_only(results)
         if fig is not None:
             plt.show()
