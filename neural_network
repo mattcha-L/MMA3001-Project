@@ -1,0 +1,336 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Oct  1 22:15:07 2026
+
+@author: myjla
+"""
+
+"""
+Incrementally train one Neural Network across multiple weeks, evaluated on a test week
+========================================================================
+Rather than training a SEPARATE model per week and combining their
+predictions afterward (the earlier "ensemble of trials" design), this
+trains ONE neural network whose weights are INCREMENTALLY UPDATED week
+by week, in chronological order, using scikit-learn's partial_fit().
+Each week's data refines the SAME set of weights -- it doesn't produce
+an independent model whose output gets averaged in afterward.
+
+WHY THIS CHANGE: the previous ensemble-of-independent-trials design
+combined multiple SEPARATELY-trained models' predictions via a
+recency-weighted average. That meant the combined prediction could
+still land well outside the true data's range whenever the
+independent models disagreed or any one of them extrapolated badly,
+and needed increasing amounts of patchwork (global clipping, a hard
+extrapolation cutoff) just to stay honest. Incremental training removes
+the combination step entirely: there's no separate "other trial" to
+diverge and get averaged in, because there's only ever one model.
+Recency falls out naturally too -- weeks are processed in chronological
+order, so the most recent week is always the LAST update applied to
+the weights, the same way online/streaming learning emphasizes recent
+data without an explicit decay weighting scheme.
+
+TEST AND VALIDATION:
+  - TRIAL_WEEKS are processed in order; each one calls partial_fit(),
+    incrementally shifting the shared weights.
+  - VALIDATION_WEEKS are never trained on. After every week's update,
+    the model is scored against them, so you can watch how performance
+    evolves as more weeks are incorporated (purely diagnostic -- there
+    is no combination step left to tune with this).
+  - TEST_WEEKS are never trained on and never looked at until the very
+    end -- the final, honest evaluation of the fully-trained model.
+
+FEATURES: elapsed time (now relative to a single SHARED reference point
+across the whole training period, not reset per week, since there's
+only one continuous model) plus sin/cos encodings of hour-of-day and
+day-of-week, so the network can separate daily/weekly cycles from the
+slower trend.
+
+Built directly on import_sensor_csv.py, weekly_grouping.py, and
+visualize_weekly.py (reuses AVAILABLE_VARIABLES, number_weeks, _thin)
+-- no changes needed to any of them, and no dependency on fit_spline.py,
+predict_trends.py, or weekly_trends.py.
+
+Change the settings below, then run this script:
+
+    VARIABLE_TO_PREDICT
+    TRIAL_WEEKS          -- weeks processed in order, each updating the shared weights
+    VALIDATION_WEEKS     -- held out; used only to monitor progress across weeks
+    TEST_WEEKS           -- held out; final honest evaluation
+    EPOCHS_PER_WEEK       -- how many partial_fit passes per week before moving on
+========================================================================
+"""
+
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
+
+from data_import import row_ids, created_at
+from weekly_groupings import group_by_week
+from data_visualisation import AVAILABLE_VARIABLES, number_weeks, print_available_weeks, _thin
+
+# ------------------------------------------------------------------
+# Human-changeable settings
+# ------------------------------------------------------------------
+VARIABLE_TO_PREDICT = "co2"        # <- a key from AVAILABLE_VARIABLES
+
+TRIAL_WEEKS = "all_except_holdout" # <- processed in chronological order; each updates the shared weights
+VALIDATION_WEEKS = [2]             # <- held out from training; used only to monitor progress across weeks
+TEST_WEEKS = "last"                # <- held out from training; final honest evaluation
+MIN_POINTS_PER_WEEK = 10
+
+EPOCHS_PER_WEEK = 50                # partial_fit passes over each week's data before moving to the next
+PLOT_MAX_POINTS = 2000              # thin scatter points for plotting only (training uses all data)
+
+# --- neural network settings ---
+NN_HIDDEN_LAYERS = (64, 32)
+NN_LEARNING_RATE_INIT = 0.001       # partial_fit has no early_stopping, so this and EPOCHS_PER_WEEK
+                                     # are what control how much each week can shift the weights
+RANDOM_SEED = 0
+# ------------------------------------------------------------------
+
+
+def _resolve_weeks(weeks_spec, week_numbers):
+    """'all', 'last', a week number, or a list of week numbers/dates -> list of week-start Timestamps."""
+    if weeks_spec is None:
+        return []
+    if isinstance(weeks_spec, str) and weeks_spec == "all":
+        return sorted(week_numbers.values())
+    if isinstance(weeks_spec, str) and weeks_spec == "last":
+        return [week_numbers[max(week_numbers)]] if week_numbers else []
+    items = [weeks_spec] if isinstance(weeks_spec, (int, str, pd.Timestamp)) else list(weeks_spec)
+    resolved = []
+    for item in items:
+        if isinstance(item, int):
+            if item in week_numbers:
+                resolved.append(week_numbers[item])
+            else:
+                print(f"[warning] week number {item} not found")
+        else:
+            ts = pd.Timestamp(item)
+            if ts in week_numbers.values():
+                resolved.append(ts)
+            else:
+                print(f"[warning] week {item} not found")
+    return resolved
+
+
+def _collect(weekly_groups, weeks):
+    """Concatenates (timestamp, value) rows for the given weeks: sorted, NaN-dropped, de-duplicated on timestamp."""
+    parts = [weekly_groups[w] for w in weeks if w in weekly_groups]
+    if not parts:
+        return pd.DataFrame(columns=["created_at", "value"])
+    combined = pd.concat(parts, ignore_index=True).dropna(subset=["value"]).sort_values("created_at")
+    return combined.drop_duplicates(subset="created_at", keep="first")
+
+
+def _to_seconds(timestamps, t0):
+    return (timestamps - t0).dt.total_seconds().to_numpy()
+
+
+def _error_metrics(y_true, y_pred):
+    residuals = y_true - y_pred
+    rmse = np.sqrt(np.mean(residuals ** 2))
+    mae = np.mean(np.abs(residuals))
+    ss_res = np.sum(residuals ** 2)
+    ss_tot = np.sum((y_true - y_true.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return {"rmse": rmse, "mae": mae, "r2": r2}
+
+
+def _build_features(timestamps, t0):
+    """Elapsed time (relative to the single shared t0) plus sin/cos hour-of-day and day-of-week."""
+    t_seconds = _to_seconds(timestamps, t0)
+    hour = timestamps.dt.hour + timestamps.dt.minute / 60
+    dow = timestamps.dt.dayofweek + hour / 24
+    return np.column_stack([
+        t_seconds,
+        np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24),
+        np.sin(2 * np.pi * dow / 7), np.cos(2 * np.pi * dow / 7),
+    ])
+
+
+def train_incremental(variable_key, trial_weeks=TRIAL_WEEKS, validation_weeks=VALIDATION_WEEKS,
+                       test_weeks=TEST_WEEKS, min_points_per_week=MIN_POINTS_PER_WEEK,
+                       epochs_per_week=EPOCHS_PER_WEEK):
+    """
+    Trains one MLPRegressor incrementally, one week at a time, in
+    chronological order. Returns a results dict with the final model,
+    the shared scaler/t0, per-week validation history, and the
+    validation/test data.
+    """
+    if variable_key not in AVAILABLE_VARIABLES:
+        raise ValueError(f"Unknown variable '{variable_key}'. Choose from: {list(AVAILABLE_VARIABLES)}")
+    values, display_name, unit = AVAILABLE_VARIABLES[variable_key]
+
+    weekly_groups, _ = group_by_week(created_at, row_id=row_ids, value=values)
+    week_numbers = number_weeks(weekly_groups)
+
+    validation_week_starts = _resolve_weeks(validation_weeks, week_numbers)
+    test_week_starts = _resolve_weeks(test_weeks, week_numbers)
+    holdout = set(validation_week_starts) | set(test_week_starts)
+
+    if trial_weeks == "all_except_holdout":
+        trial_week_starts = sorted(w for w in week_numbers.values() if w not in holdout)
+    else:
+        candidate = _resolve_weeks(trial_weeks, week_numbers)
+        overlap = [w for w in candidate if w in holdout]
+        if overlap:
+            print(f"[warning] {display_name}: {len(overlap)} week(s) requested for training also "
+                  f"appear in validation/test -- removing from training to avoid leakage.")
+        trial_week_starts = sorted(w for w in candidate if w not in holdout)
+
+    validation_data = _collect(weekly_groups, validation_week_starts)
+    test_data = _collect(weekly_groups, test_week_starts)
+
+    all_trial_data = _collect(weekly_groups, trial_week_starts)
+    if len(all_trial_data) == 0:
+        print(f"[error] {display_name}: no training data available -- check TRIAL_WEEKS/TEST_WEEKS.")
+        return None
+
+    # ONE shared time reference and ONE scaler fit once across all training
+    # weeks combined -- consistent features for the whole incremental process.
+    t0 = all_trial_data["created_at"].min()
+    scaler = StandardScaler().fit(_build_features(all_trial_data["created_at"], t0))
+
+    model = MLPRegressor(hidden_layer_sizes=NN_HIDDEN_LAYERS, learning_rate_init=NN_LEARNING_RATE_INIT,
+                         random_state=RANDOM_SEED)
+
+    validation_history = []
+    n_weeks_trained = 0
+    for week_start in trial_week_starts:
+        week_number = next(n for n, w in week_numbers.items() if w == week_start)
+        week_data = _collect(weekly_groups, [week_start])
+        if len(week_data) < min_points_per_week:
+            print(f"[skip] {display_name}: week {week_number} ({week_start.date()}) has only "
+                  f"{len(week_data)} point(s), need at least {min_points_per_week} -- skipping.")
+            continue
+
+        X_week = scaler.transform(_build_features(week_data["created_at"], t0))
+        y_week = week_data["value"].to_numpy()
+
+        t_fit0 = time.perf_counter()
+        for _ in range(epochs_per_week):
+            model.partial_fit(X_week, y_week)
+        fit_seconds = time.perf_counter() - t_fit0
+        n_weeks_trained += 1
+
+        msg = f"{display_name}: week {week_number} ({week_start.date()}) -- updated weights with " \
+              f"{len(week_data)} point(s) over {epochs_per_week} epochs in {fit_seconds:.2f}s"
+        if len(validation_data) > 0:
+            X_val = scaler.transform(_build_features(validation_data["created_at"], t0))
+            y_val_pred = model.predict(X_val)
+            val_metrics = _error_metrics(validation_data["value"].to_numpy(), y_val_pred)
+            validation_history.append({"week_number": week_number, "week_start": week_start, **val_metrics})
+            msg += f" | running validation RMSE {val_metrics['rmse']:.3f} {unit}, R^2 {val_metrics['r2']:.3f}"
+        print(msg)
+
+    if n_weeks_trained == 0:
+        print(f"[error] {display_name}: no week had enough data to train on.")
+        return None
+
+    results = {
+        "variable_key": variable_key, "display_name": display_name, "unit": unit,
+        "model": model, "scaler": scaler, "t0": t0, "n_weeks_trained": n_weeks_trained,
+        "trial_data": all_trial_data, "validation_data": validation_data, "test_data": test_data,
+        "validation_history": validation_history,
+    }
+
+    if len(test_data) > 0:
+        X_test = scaler.transform(_build_features(test_data["created_at"], t0))
+        y_pred = model.predict(X_test)
+        y_true = test_data["value"].to_numpy()
+        metrics = _error_metrics(y_true, y_pred)
+        results.update(test_pred=y_pred, **metrics)
+        r2_str = "n/a" if np.isnan(metrics["r2"]) else f"{metrics['r2']:.3f}"
+        print(f"{display_name}: FINAL model evaluated on {len(test_data)} test point(s) -- "
+              f"RMSE {metrics['rmse']:.3f} {unit}, MAE {metrics['mae']:.3f} {unit}, R^2 {r2_str}")
+    else:
+        print(f"[warning] {display_name}: no test data available -- check TEST_WEEKS")
+
+    return results
+
+
+def plot_incremental_evaluation(results):
+    """
+    Two panels: (left) the test week's true data vs. the final model's
+    prediction at those same timestamps, with faint training-week data
+    for context; (right) predicted vs. true scatter for the test week.
+    """
+    if results is None or "test_pred" not in results:
+        return None
+    trial_data, test_data = results["trial_data"], results["test_data"]
+    display_name, unit = results["display_name"], results["unit"]
+    y_pred = results["test_pred"]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5.5), gridspec_kw={"width_ratios": [2, 1]})
+
+    trial_plot = _thin(trial_data, PLOT_MAX_POINTS)
+    ax1.scatter(trial_plot["created_at"], trial_plot["value"], s=10, alpha=0.3, color="steelblue",
+               label="Training data (all weeks)")
+
+    order = np.argsort(test_data["created_at"].to_numpy())
+    times_sorted = test_data["created_at"].to_numpy()[order]
+    y_true_sorted = test_data["value"].to_numpy()[order]
+    y_pred_sorted = y_pred[order]
+
+    thin_idx = np.linspace(0, len(times_sorted) - 1, min(PLOT_MAX_POINTS, len(times_sorted))).astype(int)
+    ax1.scatter(times_sorted[thin_idx], y_true_sorted[thin_idx], s=20, alpha=0.6,
+               color="crimson", marker="s", label="True test data")
+    ax1.plot(times_sorted, y_pred_sorted, color="darkorange", linewidth=2.5, label="Model prediction")
+
+    ax1.set_title(f"{display_name} -- incrementally trained over {results['n_weeks_trained']} week(s)")
+    ax1.set_xlabel("Created At")
+    ax1.set_ylabel(f"{display_name} ({unit})")
+    ax1.grid(True, alpha=0.3, linestyle="--")
+    ax1.legend(fontsize=9)
+    ax1.tick_params(axis="x", rotation=30)
+
+    y_true = test_data["value"].to_numpy()
+    lims = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
+    ax2.plot(lims, lims, "k--", linewidth=1, label="Perfect prediction")
+    ax2.scatter(y_true, y_pred, s=20, alpha=0.5, color="crimson")
+    ax2.set_xlabel(f"True {display_name} ({unit})")
+    ax2.set_ylabel(f"Predicted {display_name} ({unit})")
+    ax2.set_title(f"Test set: R\u00b2={results['r2']:.3f}, RMSE={results['rmse']:.2f}")
+    ax2.grid(True, alpha=0.3, linestyle="--")
+    ax2.legend(fontsize=9)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_validation_progress(results):
+    """Shows how validation RMSE/R^2 evolved as each successive week's data updated the shared weights."""
+    if results is None:
+        return None
+    history = results.get("validation_history")
+    if not history:
+        return None
+    display_name, unit = results["display_name"], results["unit"]
+    weeks = [h["week_number"] for h in history]
+    rmses = [h["rmse"] for h in history]
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(weeks, rmses, marker="o", color="steelblue")
+    ax.set_xlabel("Training week (in order trained)")
+    ax.set_ylabel(f"Validation RMSE ({unit})")
+    ax.set_title(f"{display_name}: validation error as weeks are incrementally added")
+    ax.grid(True, alpha=0.3, linestyle="--")
+    fig.tight_layout()
+    return fig
+
+
+if __name__ == "__main__":
+    print_available_weeks(number_weeks(group_by_week(created_at)[0]))
+    print()
+
+    results = train_incremental(VARIABLE_TO_PREDICT)
+    if results is not None:
+        plot_validation_progress(results)
+        fig = plot_incremental_evaluation(results)
+        if fig is not None:
+            plt.show()
