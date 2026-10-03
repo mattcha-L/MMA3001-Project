@@ -70,9 +70,11 @@ from data_visualisation import AVAILABLE_VARIABLES, number_weeks, print_availabl
 # ------------------------------------------------------------------
 VARIABLE_TO_PREDICT = "co2"        # <- a key from AVAILABLE_VARIABLES
 
-TRIAL_WEEKS = [1,2,3,4,5,6,7,8,9] # <- processed in chronological order; each updates the shared weights
-VALIDATION_WEEKS = [10]             # <- held out from training; used only to monitor progress across weeks
-TEST_WEEKS = [11]                # <- held out from training; final honest evaluation
+first_half_test = np.arange(0,16).tolist()
+second_half_test = np.arange(18,50).tolist()
+TRIAL_WEEKS = second_half_test # <- processed in chronological order; each updates the shared weights
+VALIDATION_WEEKS = [50]             # <- held out from training; used only to monitor progress across weeks
+TEST_WEEKS = [51]                # <- held out from training; final honest evaluation
 MIN_POINTS_PER_WEEK = 10
 
 EPOCHS_PER_WEEK = 50                # partial_fit passes over each week's data before moving to the next
@@ -255,7 +257,7 @@ def plot_incremental_evaluation(results):
     """
     if results is None or "test_pred" not in results:
         return None
-    trial_data, test_data = results["trial_data"], results["test_data"]
+    trial_data, validation_data, test_data = results["trial_data"], results["validation_data"], results["test_data"]
     display_name, unit = results["display_name"], results["unit"]
     y_pred = results["test_pred"]
 
@@ -264,16 +266,18 @@ def plot_incremental_evaluation(results):
     trial_plot = _thin(trial_data, PLOT_MAX_POINTS)
     ax1.scatter(trial_plot["created_at"], trial_plot["value"], s=10, alpha=0.3, color="steelblue",
                label="Training data (all weeks)")
-
+    validation_plot = _thin(validation_data, PLOT_MAX_POINTS)
+    ax1.scatter(validation_plot["created_at"], validation_plot["value"], s=10, alpha=0.3, color="green",
+           label="Validation data")
     order = np.argsort(test_data["created_at"].to_numpy())
     times_sorted = test_data["created_at"].to_numpy()[order]
     y_true_sorted = test_data["value"].to_numpy()[order]
     y_pred_sorted = y_pred[order]
 
     thin_idx = np.linspace(0, len(times_sorted) - 1, min(PLOT_MAX_POINTS, len(times_sorted))).astype(int)
-    ax1.scatter(times_sorted[thin_idx], y_true_sorted[thin_idx], s=20, alpha=0.6,
+    ax1.scatter(times_sorted[thin_idx], y_true_sorted[thin_idx], s=10, alpha=0.3,
                color="crimson", marker="s", label="True test data")
-    ax1.plot(times_sorted, y_pred_sorted, color="darkorange", linewidth=2.5, label="Model prediction")
+    ax1.plot(times_sorted, y_pred_sorted, color="darkorange", linewidth=1, label="Model prediction")
 
     ax1.set_title(f"{display_name} -- incrementally trained over {results['n_weeks_trained']} week(s)")
     ax1.set_xlabel("Created At")
