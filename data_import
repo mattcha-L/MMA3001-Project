@@ -1,0 +1,184 @@
+"""
+Import a sensor-log CSV and split it into per-variable arrays
+========================================================================
+Expects a comma-delimited CSV with a header row:
+
+    id,sensorid,devicetype,jsondata,status,processing_errors,createdate,processdate
+
+`jsondata` is a JSON array, standard CSV-quoted (fields containing
+commas/quotes are wrapped in "..." with internal quotes doubled).
+Each element looks like:
+
+    {"values": [{"time": 1702273965, "value": 603}],
+     "variable": {"id": 67, "name": "Carbon dioxide", "unit": "ppm", ...}}
+
+This version reads the whole file at once with pandas (vectorized,
+C-level CSV parsing) and vectorizes everything downstream that can be
+vectorized: date parsing runs once over a whole column instead of once
+per row, and per-variable arrays are built with a single reindex +
+to_numpy() call rather than a manual list-per-variable loop. Only the
+JSON parsing itself stays row-wise -- each blob is an independent
+document, so there's no way around visiting each one -- but even that
+runs as a single vectorized .map() rather than an explicit for-loop.
+
+Produces the same outputs as before: row_ids, timestamps, created_at,
+processed_at, and one NumPy array per sensor variable (co2,
+temperature, humidity, pressure, ...), all aligned by index.
+========================================================================
+"""
+
+import json
+
+import numpy as np
+import pandas as pd
+
+PATH = "5EnvSensor_MayToDec2024_180kRows.csv"  # <- change to your file's path
+
+# The variables we want as named arrays. Add/remove names here -- the
+# key must match the JSON "name" field exactly. Any variable name that
+# never shows up anywhere in the file simply becomes an all-NaN column,
+# same as before.
+VARIABLE_NAMES = [
+    "Battery",
+    "Carbon dioxide",
+    "Humidity",
+    "Formaldehyde",
+    "Pressure",
+    "Temperature",
+    "Light Volatile Organic Compounds",
+    "Particulate matter 1",
+    "Particulate matter 4",
+    "Particulate matter 2.5",
+    "Particulate matter 10",
+]
+
+
+def _safe_json_loads(text):
+    """None on bad JSON instead of raising, so one bad row doesn't kill the whole load."""
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _flatten(readings):
+    """
+    Turns one row's JSON reading list into a single flat dict:
+    {"Battery": 4.1875, "Carbon dioxide": 603, ..., "_time": 1702273965}
+    "_time" is the shared Unix-epoch timestamp for the row (seconds, UTC).
+    """
+    record = {}
+    row_time = None
+    for entry in readings:
+        variable = entry.get("variable", {})
+        name = variable.get("name")
+        values = entry.get("values", [])
+        if not values:
+            continue                      # no reading at all for this variable
+        point = values[0]                 # first/only reading per variable
+        if "time" in point:
+            row_time = point["time"]      # shared timestamp for the row
+        if name is not None:
+            record[name] = point.get("value")  # None if value is missing
+    record["_time"] = row_time
+    return record
+
+
+# ------------------------------------------------------------------
+# 1. Read the whole file at once -- vectorized C-level CSV parsing,
+#    versus a Python-level csv.DictReader loop.
+# ------------------------------------------------------------------
+raw = pd.read_csv(PATH, dtype=str)
+
+# ------------------------------------------------------------------
+# 2. Parse the JSON blobs. Inherently row-wise (each blob is its own
+#    document), but done as one vectorized .map() call, and bad rows
+#    are dropped in a single boolean-mask operation instead of a
+#    per-row try/except inside a loop.
+# ------------------------------------------------------------------
+readings_col = raw["jsondata"].map(_safe_json_loads)
+bad = readings_col.isna()
+if bad.any():
+    print(f"[skip] {bad.sum()} row(s) with unreadable jsondata: ids {raw.loc[bad, 'id'].tolist()}")
+raw = raw.loc[~bad].reset_index(drop=True)
+readings_col = readings_col.loc[~bad].reset_index(drop=True)
+
+# ------------------------------------------------------------------
+# 3. Flatten each row to one dict, then build the wide table in a
+#    single pd.DataFrame() call. This replaces the old nested loop
+#    (extract per-variable values, then loop again to append into
+#    per-variable lists) with one pass per row plus one vectorized
+#    table construction.
+# ------------------------------------------------------------------
+records = readings_col.map(_flatten)
+wide = pd.DataFrame(records.tolist())
+
+# ------------------------------------------------------------------
+# 3b. Drop exact duplicate readings: identical reading time AND an
+#     identical value for every variable. This is a genuine data
+#     issue, confirmed in this file -- e.g. row ids 2, 4, and 38 all
+#     have time=1702273965 and Carbon dioxide=603 (and every other
+#     variable matching too). The same physical reading was logged
+#     three times under three different database row ids.
+#
+#     Left in, each duplicate group re-plots the exact same y-value
+#     at a different x-position (different createdate). If this
+#     duplication happens repeatedly throughout a larger file -- the
+#     same reading re-logged every so often -- those fixed values
+#     keep reappearing at many different times across the whole date
+#     range. On a time-series plot that looks like a flat horizontal
+#     "band" running continuously across the graph, when it's
+#     actually many discrete duplicate points lined up at the same
+#     height, not one real continuous signal.
+#
+#     keep="first" is safe here specifically because duplication is
+#     checked across EVERY variable column plus the reading time --
+#     two rows are only dropped as duplicates if literally everything
+#     matches. Two genuinely different readings that happen to share
+#     a timestamp, but differ in value, are NOT touched by this.
+# ------------------------------------------------------------------
+dup_mask = wide.duplicated(keep="first")
+raw = raw.loc[~dup_mask].reset_index(drop=True)
+wide = wide.loc[~dup_mask].reset_index(drop=True)
+
+# Guarantee every expected variable is present as a column (missing
+# ones become all-NaN) in a single vectorized reindex, rather than a
+# per-variable .get()/fallback loop.
+wide_vars = wide.reindex(columns=VARIABLE_NAMES)
+
+# ------------------------------------------------------------------
+# 4. Vectorized date handling: each column is converted ONCE, in one
+#    call, instead of once per row inside the read loop.
+# ------------------------------------------------------------------
+row_ids = raw["id"].to_numpy()
+# "_time" is a Unix epoch (seconds, always UTC by definition -- no
+# local-timezone ambiguity here). Rows with no time found stay NaT
+# rather than being dropped or miscoded as a falsy-but-valid epoch 0.
+timestamps = pd.to_datetime(wide["_time"], unit="s", utc=True).to_numpy()
+# createdate / processdate are ISO-like strings with a numeric UTC
+# offset (e.g. "2024-02-29 03:11:58.210358+11"). utc=True is required
+# here, not optional: Melbourne's offset changes between +11 (AEDT)
+# and +10 (AEST) across the DST boundary, so a file spanning more than
+# a few months will have mixed offsets in this column. Without
+# utc=True, pandas can't build one consistent datetime64 array from
+# mixed offsets and raises a ValueError partway through -- utc=True
+# normalizes everything onto a single UTC timeline first.
+created_at = pd.to_datetime(raw["createdate"], utc=True).to_numpy()
+processed_at = pd.to_datetime(raw["processdate"], utc=True).to_numpy()
+
+# ------------------------------------------------------------------
+# 5. Pull out each named variable as a NumPy array with one
+#    vectorized .to_numpy() call per column (no manual per-row
+#    list building).
+# ------------------------------------------------------------------
+battery = wide_vars["Battery"].to_numpy(dtype=float)
+co2 = wide_vars["Carbon dioxide"].to_numpy(dtype=float)
+humidity = wide_vars["Humidity"].to_numpy(dtype=float)
+formaldehyde = wide_vars["Formaldehyde"].to_numpy(dtype=float)
+pressure = wide_vars["Pressure"].to_numpy(dtype=float)
+temperature = wide_vars["Temperature"].to_numpy(dtype=float)
+voc = wide_vars["Light Volatile Organic Compounds"].to_numpy(dtype=float)
+pm1 = wide_vars["Particulate matter 1"].to_numpy(dtype=float)
+pm4 = wide_vars["Particulate matter 4"].to_numpy(dtype=float)
+pm25 = wide_vars["Particulate matter 2.5"].to_numpy(dtype=float)
+pm10 = wide_vars["Particulate matter 10"].to_numpy(dtype=float)

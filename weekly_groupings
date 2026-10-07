@@ -1,0 +1,79 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Sep 22 21:53:59 2026
+
+@author: myjla
+"""
+
+import pandas as pd
+ 
+# pandas' "W-XXX" anchor names the day a week *ends* on, not starts on
+# (e.g. "W-MON" = Tue-through-Mon). To get weeks that *start* on a given
+# day, anchor on the day immediately before it.
+_DAY_BEFORE = {"MON": "SUN", "TUE": "MON", "WED": "TUE", "THU": "WED",
+               "FRI": "THU", "SAT": "FRI", "SUN": "SAT"}
+ 
+ 
+def group_by_week(created_at, week_start_day="MON", **columns):
+    """
+    Groups readings into calendar weeks based on `created_at`.
+ 
+    Parameters
+    ----------
+    created_at : array-like of datetime (tz-aware or naive, None allowed)
+        One created_at per reading/row.
+    week_start_day : str
+        "MON" (default, ISO-style weeks) or "SUN" -- which day each week starts on.
+    **columns : array-like
+        Any number of equal-length arrays to carry along, keyed by name,
+        e.g. co2=co2, temperature=temperature. All must be the same
+        length as `created_at`.
+ 
+    Returns
+    -------
+    weekly_groups : dict[pandas.created_at, pandas.DataFrame]
+        One entry per week that actually has data, keyed by the date
+        the week starts.
+    weekly_summary : pandas.DataFrame
+        Mean and count of each numeric column, per week.
+    """
+    df = pd.DataFrame({"created_at": pd.to_datetime(list(created_at))})
+    for name, values in columns.items():
+        df[name] = list(values)
+ 
+    # rows with no resolvable created_at can't be dated -- drop, but say so
+    undated = df[df["created_at"].isna()]
+    df = df.dropna(subset=["created_at"]).copy()
+    if len(undated):
+        print(f"[warning] {len(undated)} reading(s) had no created_at and were excluded from weekly grouping")
+ 
+    # periods are timezone-naive by design; drop tz explicitly for the bucketing step
+    week_basis = df["created_at"].dt.tz_convert(None) if df["created_at"].dt.tz is not None else df["created_at"]
+    anchor = _DAY_BEFORE[week_start_day.upper()]
+    df["week_start"] = week_basis.dt.to_period(f"W-{anchor}").apply(lambda p: p.start_time)
+ 
+    weekly_groups = {
+        week_start: group.drop(columns="week_start").reset_index(drop=True)
+        for week_start, group in df.groupby("week_start")
+    }
+ 
+    numeric_cols = [c for c in columns if pd.api.types.is_numeric_dtype(df[c])]
+    weekly_summary = (
+        df.groupby("week_start")[numeric_cols].agg(["mean", "count"]).sort_index()
+        if numeric_cols else pd.DataFrame(index=sorted(weekly_groups))
+    )
+ 
+    return weekly_groups, weekly_summary
+ 
+ 
+if __name__ == "__main__":
+    # Example: pull the arrays built by import_sensor_csv.py and group them.
+    # Swap this block out for whatever arrays your own import step produced --
+    # group_by_week() only needs a `created_at` array plus optional named columns.
+    from MMA3001_Data_Analysis import row_ids, created_at, co2, temperature, humidity, pressure
+ 
+    weekly_groups, weekly_summary = group_by_week(
+        created_at,
+        row_id=row_ids, co2=co2, temperature=temperature,
+        humidity=humidity, pressure=pressure,
+    )
