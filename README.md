@@ -16,15 +16,15 @@ Documentation:
 ## How to use
 1. data_import.py\
   a. set path (default: 5EnvSensor_MayToDec2024_180kRows.csv)\
-  b. set variable names of environmental data (default: Battery, Carbon dioxide, Humidity, Formaldehyde, Pressure, Temperatures, Light Volatile Organic Compounds, Particulate matter 1, Particular matter 4, Particulate matter 2.5, Particulate matter 10)\
+  b. set variable names of environmental data (default: Battery, Carbon dioxide, Humidity, Formaldehyde, Pressure, Temperatures, Light Volatile Organic Compounds, Particulate matter 1, Particular matter 4, Particulate matter 2.5, Particulate matter 10)
 2. weekly_groupings.py\
-   a. change import environmental data variables from data_import (otherwise leave as default) \
+   a. change import environmental data variables from data_import (otherwise leave as default) 
 3. data_visualisation.py\
    a. change import environmental data variables from data_import (otherwise leave as default)\
-   b. change AVAILABLE_VARIABLES to match import variable names and units\
+   b. change AVAILABLE_VARIABLES to match import variable names and units
 4. neural_network.py\
    a. set VARIABLE_TO_PREDICT from AVAILABLE_VARIABLES\
-   b. set TRIAL_WEEKS, VALIDATION_WEEKS, TEST_WEEKS, MIN_POINTS_PER_WEEK, EPOCHS_PER_WEEK, PLOT_MAX_POINTS, NN_HIDDEN_LAYERS, NN_LEARNING_RATE_INIT, RANDOM_SEED as learning parameters for the model ensuring trial, validation and test weeks do not overlap. \
+   b. set TRIAL_WEEKS, VALIDATION_WEEKS, TEST_WEEKS, MIN_POINTS_PER_WEEK, EPOCHS_PER_WEEK, PLOT_MAX_POINTS, NN_HIDDEN_LAYERS, NN_LEARNING_RATE_INIT, RANDOM_SEED as learning parameters for the model ensuring trial, validation and test weeks do not overlap. 
 
 # Environment
 - Uses the Anaconda base (root) environment
