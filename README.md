@@ -1,19 +1,19 @@
 # MMA3001-Project
 Repository for MMA3001 Project
 
-#Purpose
+# Purpose
 Neural network regression that determines weekly trends, optimised for CO2 data from environmental data from Monash University's Innovation Labs.
 
 Data: https://drive.google.com/file/d/1GbetinMEAYgJMWe9HvRWvOIxe4vzhFgX/view?usp=drive_link
 
-#Usage
+# Usage
 Documentation: 
 - Finds overall weekly trends in data to be used for later analysis.
 - Organised into separate modules for data importing and processing, weekly groupings, data visualisation and validation, training and testing.
 - The data importing and processing is easy to change to accept other environmental variables without requiring other code files to be changed.
 - Requires data to be in a format consistent with Monash Smart Infrastructure Occupancy and Environmental Data, however this can be easily adjusted in data_import.py
 
-How to use
+## How to use
 1. data_import.py
   a. set path (default: 5EnvSensor_MayToDec2024_180kRows.csv)
   b. set variable names of environmental data (default: Battery, Carbon dioxide, Humidity, Formaldehyde, Pressure, Temperatures, Light Volatile Organic Compounds, Particulate matter 1, Particular matter 4, Particulate matter 2.5, Particulate matter 10)
@@ -26,14 +26,14 @@ How to use
    a. set VARIABLE_TO_PREDICT from AVAILABLE_VARIABLES
    b. set TRIAL_WEEKS, VALIDATION_WEEKS, TEST_WEEKS, MIN_POINTS_PER_WEEK, EPOCHS_PER_WEEK, PLOT_MAX_POINTS, NN_HIDDEN_LAYERS, NN_LEARNING_RATE_INIT, RANDOM_SEED as learning parameters for the model ensuring trial, validation and test weeks do not overlap. 
 
-#Environment
+# Environment
 - Uses the Anaconda base (root) environment
 - The code is written in Python
   
-#Dependencies
+# Dependencies
 - Depends on inbuilt Python functions: time, NumPy, pandas, scikit-learn and Matplotlib.
   
-#License
+# License
 This project is licensed under the MIT license.
 MIT License: http://en.wikipedia.org/wiki/MIT_License
 
