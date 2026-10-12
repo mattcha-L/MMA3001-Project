@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Oct 12 23:51:43 2026
+
+@author: myjla
+"""
+
 """
 Incrementally train one Neural Network across multiple weeks, evaluated on a test week
 ========================================================================
@@ -38,6 +45,18 @@ only one continuous model) plus sin/cos encodings of hour-of-day and
 day-of-week, so the network can separate daily/weekly cycles from the
 slower trend.
 
+CROSS-VALIDATION: a single train/test split only tells you how this
+approach does for one particular choice of test week. cross_validate()
+runs WALK-FORWARD cross-validation instead -- for each fold, training
+on an expanding window of the earliest weeks and testing on the very
+next one, sliding forward one week at a time. This is the time-series-
+appropriate analogue of k-fold CV: plain k-fold would shuffle weeks
+randomly across folds, which would let a fold train on weeks that come
+AFTER its own test week -- future information leaking into training,
+which can't happen in a real forecasting setting. Walk-forward CV never
+does that. Each fold trains a completely fresh model from scratch (nothing
+carries over between folds), so folds are independent of each other.
+
 Built directly on import_sensor_csv.py, weekly_grouping.py, and
 visualize_weekly.py (reuses AVAILABLE_VARIABLES, number_weeks, _thin)
 -- no changes needed to any of them, and no dependency on fit_spline.py,
@@ -70,15 +89,23 @@ from data_visualisation import AVAILABLE_VARIABLES, number_weeks, print_availabl
 # ------------------------------------------------------------------
 VARIABLE_TO_PREDICT = "co2"        # <- a key from AVAILABLE_VARIABLES
 
-first_half_test = np.arange(0,16).tolist()
-second_half_test = np.arange(18,50).tolist()
-TRIAL_WEEKS = second_half_test # <- processed in chronological order; each updates the shared weights
-VALIDATION_WEEKS = [50]             # <- held out from training; used only to monitor progress across weeks
-TEST_WEEKS = [51]                # <- held out from training; final honest evaluation
+TRIAL_WEEKS = "all_except_holdout" # <- processed in chronological order; each updates the shared weights
+VALIDATION_WEEKS = [2]             # <- held out from training; used only to monitor progress across weeks
+TEST_WEEKS = "last"                # <- held out from training; final honest evaluation
 MIN_POINTS_PER_WEEK = 10
 
 EPOCHS_PER_WEEK = 50                # partial_fit passes over each week's data before moving to the next
 PLOT_MAX_POINTS = 2000              # thin scatter points for plotting only (training uses all data)
+
+RUN_CROSS_VALIDATION = True         # also run walk-forward cross-validation (see cross_validate() below)
+CV_MIN_TRAIN_WEEKS = 3              # smallest training window a fold is allowed to start from
+CV_FOLD_STEP = 10                    # run every Nth fold instead of every single one -- THE MAIN RUNTIME
+                                     # KNOB. Each fold retrains a fresh model from scratch on an expanding
+                                     # window, so with W available weeks and CV_FOLD_STEP=1, total work is
+                                     # roughly W^2/2 "week-trainings" (e.g. 13 weeks -> ~75, a ~6x
+                                     # redundancy versus training once). CV_FOLD_STEP=2 tests every other
+                                     # week and roughly HALVES both the fold count and the total runtime;
+                                     # CV_FOLD_STEP=3 roughly a third, and so on.
 
 # --- neural network settings ---
 NN_HIDDEN_LAYERS = (64, 32)
@@ -249,6 +276,112 @@ def train_incremental(variable_key, trial_weeks=TRIAL_WEEKS, validation_weeks=VA
     return results
 
 
+def cross_validate(variable_key=VARIABLE_TO_PREDICT, min_train_weeks=CV_MIN_TRAIN_WEEKS,
+                    epochs_per_week=EPOCHS_PER_WEEK, fold_step=CV_FOLD_STEP):
+    """
+    Walk-forward cross-validation. For fold k, trains a FRESH model
+    (from scratch, independent of every other fold) on the first k
+    available weeks and tests on week k+1 -- so every fold respects
+    chronological order and performance is assessed across many
+    different train/test splits, not just one. fold_step > 1 skips
+    folds (tests every Nth week instead of every week) to directly
+    cut runtime -- see CV_FOLD_STEP's comment for why this is the
+    main cost driver.
+
+    Prints an upfront estimate of total runtime (timed from the first
+    fold actually run) before committing to the rest, since walk-
+    forward CV's cost can be substantial on large datasets.
+
+    Returns a list of per-fold dicts (n_train_weeks, test_week_number,
+    test_week_start, rmse, mae, r2) and prints a summary across folds.
+    """
+    if variable_key not in AVAILABLE_VARIABLES:
+        raise ValueError(f"Unknown variable '{variable_key}'. Choose from: {list(AVAILABLE_VARIABLES)}")
+    _, display_name, unit = AVAILABLE_VARIABLES[variable_key]
+
+    weekly_groups, _ = group_by_week(created_at, row_id=row_ids, value=AVAILABLE_VARIABLES[variable_key][0])
+    week_numbers = number_weeks(weekly_groups)
+    all_weeks = sorted(week_numbers.values())
+
+    if len(all_weeks) <= min_train_weeks:
+        print(f"[error] {display_name}: only {len(all_weeks)} week(s) available, need more than "
+              f"CV_MIN_TRAIN_WEEKS={min_train_weeks} to run even one fold.")
+        return []
+
+    fold_ks = list(range(min_train_weeks, len(all_weeks), fold_step))
+    total_week_trainings = sum(fold_ks)
+    print(f"{display_name}: {len(fold_ks)} fold(s) planned (CV_FOLD_STEP={fold_step}), "
+          f"{total_week_trainings} total week-trainings (vs {len(all_weeks)} weeks of unique data -- "
+          f"a {total_week_trainings / len(all_weeks):.1f}x redundancy, inherent to walk-forward CV).")
+
+    fold_results = []
+    cv_t0 = time.perf_counter()
+    for i, k in enumerate(fold_ks):
+        train_weeks_fold = all_weeks[:k]
+        test_week_fold = all_weeks[k]
+        test_week_number = next(n for n, w in week_numbers.items() if w == test_week_fold)
+        print(f"\n--- Fold {i + 1}/{len(fold_ks)}: train on weeks 1..{k}, "
+              f"test on week {test_week_number} ({test_week_fold.date()}) ---")
+
+        result = train_incremental(variable_key, trial_weeks=train_weeks_fold, validation_weeks=[],
+                                   test_weeks=[test_week_fold], epochs_per_week=epochs_per_week)
+
+        if i == 0:
+            elapsed = time.perf_counter() - cv_t0
+            est_total = elapsed * total_week_trainings / k
+            print(f"[estimate] first fold took {elapsed:.1f}s ({k} week-trainings) -- "
+                  f"projected total for all {len(fold_ks)} fold(s): ~{est_total:.0f}s "
+                  f"({est_total / 60:.1f} min). Lower CV_FOLD_STEP's effect is the opposite -- "
+                  f"raise it, or raise CV_MIN_TRAIN_WEEKS, to cut this down.")
+
+        if result is not None and "rmse" in result:
+            fold_results.append({
+                "fold": k - min_train_weeks + 1, "n_train_weeks": k,
+                "test_week_number": test_week_number, "test_week_start": test_week_fold,
+                "rmse": result["rmse"], "mae": result["mae"], "r2": result["r2"],
+            })
+
+    if fold_results:
+        rmses = np.array([f["rmse"] for f in fold_results])
+        r2s = np.array([f["r2"] for f in fold_results])
+        print(f"\nCross-validation summary over {len(fold_results)} fold(s):")
+        print(f"  RMSE: mean={rmses.mean():.3f}, std={rmses.std():.3f}, "
+              f"min={rmses.min():.3f}, max={rmses.max():.3f} {unit}")
+        print(f"  R^2:  mean={r2s.mean():.3f}, std={r2s.std():.3f}")
+    else:
+        print("[warning] No folds produced a result -- check MIN_POINTS_PER_WEEK and CV_MIN_TRAIN_WEEKS.")
+
+    return fold_results
+
+
+def plot_cross_validation(fold_results, variable_key=VARIABLE_TO_PREDICT):
+    """Two panels: test RMSE and test R^2 across walk-forward folds, by training-window size."""
+    if not fold_results:
+        return None
+    _, display_name, unit = AVAILABLE_VARIABLES[variable_key]
+    n_train = [f["n_train_weeks"] for f in fold_results]
+    rmses = [f["rmse"] for f in fold_results]
+    r2s = [f["r2"] for f in fold_results]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 4.5))
+
+    ax1.plot(n_train, rmses, marker="o", color="steelblue")
+    ax1.set_xlabel("Number of training weeks (walk-forward)")
+    ax1.set_ylabel(f"Test RMSE ({unit})")
+    ax1.set_title(f"{display_name}: cross-validated RMSE by fold")
+    ax1.grid(True, alpha=0.3, linestyle="--")
+
+    ax2.plot(n_train, r2s, marker="o", color="seagreen")
+    ax2.axhline(0, color="gray", linestyle=":", linewidth=1)
+    ax2.set_xlabel("Number of training weeks (walk-forward)")
+    ax2.set_ylabel("Test R\u00b2")
+    ax2.set_title(f"{display_name}: cross-validated R\u00b2 by fold")
+    ax2.grid(True, alpha=0.3, linestyle="--")
+
+    fig.tight_layout()
+    return fig
+
+
 def plot_incremental_evaluation(results):
     """
     Two panels: (left) the test week's true data vs. the final model's
@@ -257,7 +390,7 @@ def plot_incremental_evaluation(results):
     """
     if results is None or "test_pred" not in results:
         return None
-    trial_data, validation_data, test_data = results["trial_data"], results["validation_data"], results["test_data"]
+    trial_data, test_data = results["trial_data"], results["test_data"]
     display_name, unit = results["display_name"], results["unit"]
     y_pred = results["test_pred"]
 
@@ -266,18 +399,16 @@ def plot_incremental_evaluation(results):
     trial_plot = _thin(trial_data, PLOT_MAX_POINTS)
     ax1.scatter(trial_plot["created_at"], trial_plot["value"], s=10, alpha=0.3, color="steelblue",
                label="Training data (all weeks)")
-    validation_plot = _thin(validation_data, PLOT_MAX_POINTS)
-    ax1.scatter(validation_plot["created_at"], validation_plot["value"], s=10, alpha=0.3, color="green",
-           label="Validation data")
+
     order = np.argsort(test_data["created_at"].to_numpy())
     times_sorted = test_data["created_at"].to_numpy()[order]
     y_true_sorted = test_data["value"].to_numpy()[order]
     y_pred_sorted = y_pred[order]
 
     thin_idx = np.linspace(0, len(times_sorted) - 1, min(PLOT_MAX_POINTS, len(times_sorted))).astype(int)
-    ax1.scatter(times_sorted[thin_idx], y_true_sorted[thin_idx], s=10, alpha=0.3,
+    ax1.scatter(times_sorted[thin_idx], y_true_sorted[thin_idx], s=20, alpha=0.6,
                color="crimson", marker="s", label="True test data")
-    ax1.plot(times_sorted, y_pred_sorted, color="darkorange", linewidth=1, label="Model prediction")
+    ax1.plot(times_sorted, y_pred_sorted, color="darkorange", linewidth=2.5, label="Model prediction")
 
     ax1.set_title(f"{display_name} -- incrementally trained over {results['n_weeks_trained']} week(s)")
     ax1.set_xlabel("Created At")
@@ -299,6 +430,7 @@ def plot_incremental_evaluation(results):
     fig.tight_layout()
     return fig
 
+
 def plot_test_week_only(results):
     """
     A single focused plot: ONLY the test week -- true data vs. the
@@ -311,17 +443,17 @@ def plot_test_week_only(results):
     test_data = results["test_data"]
     display_name, unit = results["display_name"], results["unit"]
     y_pred = results["test_pred"]
- 
+
     order = np.argsort(test_data["created_at"].to_numpy())
     times_sorted = test_data["created_at"].to_numpy()[order]
     y_true_sorted = test_data["value"].to_numpy()[order]
     y_pred_sorted = y_pred[order]
- 
+
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.scatter(times_sorted, y_true_sorted, s=15, alpha=0.6, color="crimson",
               marker="s", label="True test data")
     ax.plot(times_sorted, y_pred_sorted, color="darkorange", linewidth=2.5, label="Model prediction")
- 
+
     ax.set_title(f"{display_name} -- test week only: true vs. predicted "
                  f"(R\u00b2={results['r2']:.3f}, RMSE={results['rmse']:.2f} {unit})")
     ax.set_xlabel("Created At")
@@ -331,6 +463,7 @@ def plot_test_week_only(results):
     ax.tick_params(axis="x", rotation=30)
     fig.tight_layout()
     return fig
+
 
 def plot_validation_progress(results):
     """Shows how validation RMSE/R^2 evolved as each successive week's data updated the shared weights."""
@@ -361,6 +494,10 @@ if __name__ == "__main__":
     if results is not None:
         plot_validation_progress(results)
         plot_incremental_evaluation(results)
-        fig = plot_test_week_only(results)
-        if fig is not None:
-            plt.show()
+        plot_test_week_only(results)
+
+    if RUN_CROSS_VALIDATION:
+        fold_results = cross_validate(VARIABLE_TO_PREDICT)
+        plot_cross_validation(fold_results, VARIABLE_TO_PREDICT)
+
+    plt.show()
