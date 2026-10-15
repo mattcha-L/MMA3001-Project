@@ -13,8 +13,18 @@ import numpy as np
 from data_import import row_ids, created_at
 from weekly_groupings import group_by_week
 from data_visualisation import VARIABLE_TO_MODEL, TIME_TO_MODEL, number_weeks, _thin
-from neural_network import RUN_CROSS_VALIDATION, PLOT_MAX_POINTS, CV_MIN_TRAIN_WEEKS, CV_FOLD_STEP, EPOCHS_PER_WEEK, TRIAL_WEEKS, train_incremental, plot_incremental_evaluation, plot_test_week_only
+from neural_network import PLOT_MAX_POINTS, EPOCHS_PER_WEEK, TRIAL_WEEKS, train_incremental, plot_incremental_evaluation, plot_test_week_only
 
+RUN_CROSS_VALIDATION = True         # also run walk-forward cross-validation (see cross_validate() below)
+CV_MIN_TRAIN_WEEKS = 3              # smallest training window a fold is allowed to start from
+CV_FOLD_STEP = 17                    # run every Nth fold instead of every single one -- THE MAIN RUNTIME
+                                     # KNOB. Each fold retrains a fresh model from scratch on an expanding
+                                     # window, so with W available weeks and CV_FOLD_STEP=1, total work is
+                                     # roughly W^2/2 "week-trainings" (e.g. 13 weeks -> ~75, a ~6x
+                                     # redundancy versus training once). CV_FOLD_STEP=2 tests every other
+                                     # week and roughly HALVES both the fold count and the total runtime;
+                                     # CV_FOLD_STEP=3 roughly a third, and so on.
+                                     
 def cross_validate(variable_key=VARIABLE_TO_MODEL, min_train_weeks=CV_MIN_TRAIN_WEEKS,
                     epochs_per_week=EPOCHS_PER_WEEK, fold_step=CV_FOLD_STEP):
     """
