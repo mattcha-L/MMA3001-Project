@@ -182,3 +182,20 @@ pm1 = wide_vars["Particulate matter 1"].to_numpy(dtype=float)
 pm4 = wide_vars["Particulate matter 4"].to_numpy(dtype=float)
 pm25 = wide_vars["Particulate matter 2.5"].to_numpy(dtype=float)
 pm10 = wide_vars["Particulate matter 10"].to_numpy(dtype=float)
+
+AVAILABLE_VARIABLES = {
+    "battery": (battery, "Battery", "V"),
+    "co2": (co2, "Carbon dioxide", "ppm"),
+    "humidity": (humidity, "Humidity", "HR%"),
+    "formaldehyde": (formaldehyde, "Formaldehyde", "\u00b5g/m3"),
+    "pressure": (pressure, "Pressure", "mb"),
+    "temperature": (temperature, "Temperature", "\u00b0C"),
+    "voc": (voc, "Light Volatile Organic Compounds", "ppb"),
+    "pm1": (pm1, "Particulate matter 1", "\u00b5g/m3"),
+    "pm4": (pm4, "Particulate matter 4", "\u00b5g/m3"),
+    "pm25": (pm25, "Particulate matter 2.5", "\u00b5g/m3"),
+    "pm10": (pm10, "Particulate matter 10", "\u00b5g/m3"),
+}
+
+VARIABLE_TO_MODEL = AVAILABLE_VARIABLES["co2"]
+TIME_TO_MODEL = created_at
