@@ -29,15 +29,16 @@ temperature, humidity, pressure, ...), all aligned by index.
 
 import json
 
-import numpy as np
 import pandas as pd
+import numpy as np
 
-PATH = "5EnvSensor_MayToDec2024_180kRows.csv"  # <- change to your file's path
-
+PATH = "5EnvSensor_MayToDec2024_180kRows.csv"  # Path to the CSV file; change as needed.
+DAY_BOUND = 14
 # The variables we want as named arrays. Add/remove names here -- the
 # key must match the JSON "name" field exactly. Any variable name that
 # never shows up anywhere in the file simply becomes an all-NaN column,
 # same as before.
+# Maps the exact JSON "name" field to the short column name we want to use.
 VARIABLE_NAMES = [
     "Battery",
     "Carbon dioxide",
@@ -54,148 +55,158 @@ VARIABLE_NAMES = [
 
 
 def _safe_json_loads(text):
-    """None on bad JSON instead of raising, so one bad row doesn't kill the whole load."""
+    """
+    Checks for bad JSON and yields ``None`` so the caller can drop the row instead of crashing
+    
+    Args:
+        text: Raw JSON string from the ``jsondata`` column.
+    
+    Returns:
+        JSON text
+    """
     try:
-        return json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        return None
+        return json.loads(text) # Decode the JSON array into Python objects.
+    except (json.JSONDecodeError, TypeError):# Malformed text, or NaN/None input.
+        return None # Signal "unreadable" to the caller.
 
 
 def _flatten(readings):
     """
-    Turns one row's JSON reading list into a single flat dict:
-    {"Battery": 4.1875, "Carbon dioxide": 603, ..., "_time": 1702273965}
-    "_time" is the shared Unix-epoch timestamp for the row (seconds, UTC).
+    Parses one ``jsondata`` string into a flat dict of readings.
+ 
+    Args:
+        readings: JSON text after being checked by _safe_json_loads
+ 
+    Returns:
+        A dict like ``{"Carbon dioxide": 603, ..., "_time": 1702273965}``, where
+        ``_time`` is the row's Unix timestamp in seconds (UTC), or ``None`` if
+        the JSON could not be parsed.
     """
+    if not isinstance(readings, list):
+        return {"_time": None}
     record = {}
-    row_time = None
-    for entry in readings:
-        variable = entry.get("variable", {})
+    row_time = None # Start with no timestamp; set it if one is found.
+    for entry in readings: # Each entry is one variable's reading.
+        variable = entry.get("variable", {}) # List of {"time", "value"} points.
         name = variable.get("name")
         values = entry.get("values", [])
-        if not values:
+        if not values: # Skip variables that have no reading.
             continue                      # no reading at all for this variable
         point = values[0]                 # first/only reading per variable
         if "time" in point:
             row_time = point["time"]      # shared timestamp for the row
-        if name is not None:
+        if name is not None: # Ignore readings with no variable name.
             record[name] = point.get("value")  # None if value is missing
     record["_time"] = row_time
     return record
 
 
-# ------------------------------------------------------------------
-# 1. Read the whole file at once -- vectorized C-level CSV parsing,
-#    versus a Python-level csv.DictReader loop.
-# ------------------------------------------------------------------
-raw = pd.read_csv(PATH, dtype=str)
+def load_sensor_data(path=PATH):
+    """
+    Reads CSV, parses JSON, removes exact duplicates, and filters out lone points
+    having fewer than 20 readings within a 2-week window either side.
+    """
+    # ------------------------------------------------------------------
+    # 1. Read the whole file at once (vectorized C-level CSV parsing).
+    # ------------------------------------------------------------------
+    raw = pd.read_csv(path, dtype=str) 
 
-# ------------------------------------------------------------------
-# 2. Parse the JSON blobs. Inherently row-wise (each blob is its own
-#    document), but done as one vectorized .map() call, and bad rows
-#    are dropped in a single boolean-mask operation instead of a
-#    per-row try/except inside a loop.
-# ------------------------------------------------------------------
-readings_col = raw["jsondata"].map(_safe_json_loads)
-bad = readings_col.isna()
-if bad.any():
-    print(f"[skip] {bad.sum()} row(s) with unreadable jsondata: ids {raw.loc[bad, 'id'].tolist()}")
-raw = raw.loc[~bad].reset_index(drop=True)
-readings_col = readings_col.loc[~bad].reset_index(drop=True)
+    # ------------------------------------------------------------------
+    # 2. Parse the JSON blobs: one vectorized .map() call, with bad rows
+    #    dropped via a single boolean mask.
+    # ------------------------------------------------------------------
+    readings_col = raw["jsondata"].map(_safe_json_loads) 
+    bad = readings_col.isna() 
+    if bad.any():
+        print(f"[skip] {bad.sum()} row(s) with unreadable jsondata: ids {raw.loc[bad, 'id'].tolist()}") 
+    raw = raw.loc[~bad].reset_index(drop=True) 
+    readings_col = readings_col.loc[~bad].reset_index(drop=True) 
 
-# ------------------------------------------------------------------
-# 3. Flatten each row to one dict, then build the wide table in a
-#    single pd.DataFrame() call. This replaces the old nested loop
-#    (extract per-variable values, then loop again to append into
-#    per-variable lists) with one pass per row plus one vectorized
-#    table construction.
-# ------------------------------------------------------------------
-records = readings_col.map(_flatten)
-wide = pd.DataFrame(records.tolist())
+    # ------------------------------------------------------------------
+    # 3. Flatten each row to one dict, then build the wide table in a
+    #    single DataFrame call.
+    # ------------------------------------------------------------------
+    records = readings_col.map(_flatten) 
+    wide = pd.DataFrame(records.tolist()) 
 
-# ------------------------------------------------------------------
-# 3b. Drop exact duplicate readings: identical reading time AND an
-#     identical value for every variable. This is a genuine data
-#     issue, confirmed in this file -- e.g. row ids 2, 4, and 38 all
-#     have time=1702273965 and Carbon dioxide=603 (and every other
-#     variable matching too). The same physical reading was logged
-#     three times under three different database row ids.
-#
-#     Left in, each duplicate group re-plots the exact same y-value
-#     at a different x-position (different createdate). If this
-#     duplication happens repeatedly throughout a larger file -- the
-#     same reading re-logged every so often -- those fixed values
-#     keep reappearing at many different times across the whole date
-#     range. On a time-series plot that looks like a flat horizontal
-#     "band" running continuously across the graph, when it's
-#     actually many discrete duplicate points lined up at the same
-#     height, not one real continuous signal.
-#
-#     keep="first" is safe here specifically because duplication is
-#     checked across EVERY variable column plus the reading time --
-#     two rows are only dropped as duplicates if literally everything
-#     matches. Two genuinely different readings that happen to share
-#     a timestamp, but differ in value, are NOT touched by this.
-# ------------------------------------------------------------------
-dup_mask = wide.duplicated(keep="first")
-raw = raw.loc[~dup_mask].reset_index(drop=True)
-wide = wide.loc[~dup_mask].reset_index(drop=True)
+    # ------------------------------------------------------------------
+    # 3b. Drop exact duplicate readings.
+    # ------------------------------------------------------------------
+    dup_mask = wide.duplicated(keep="first") 
+    raw = raw.loc[~dup_mask].reset_index(drop=True) 
+    wide = wide.loc[~dup_mask].reset_index(drop=True) 
 
-# Guarantee every expected variable is present as a column (missing
-# ones become all-NaN) in a single vectorized reindex, rather than a
-# per-variable .get()/fallback loop.
-wide_vars = wide.reindex(columns=VARIABLE_NAMES)
+    # ------------------------------------------------------------------
+    # 3c. Remove lone points with < 20 readings within two weeks either side
+    # ------------------------------------------------------------------
+    temp_timestamps = pd.to_datetime(wide["_time"], unit="s", utc=True) 
+    temp_df = pd.DataFrame({
+        "orig_idx": np.arange(len(wide)),
+        "timestamps": temp_timestamps
+    })
 
-# ------------------------------------------------------------------
-# 4. Vectorized date handling: each column is converted ONCE, in one
-#    call, instead of once per row inside the read loop.
-# ------------------------------------------------------------------
-row_ids = raw["id"].to_numpy()
-# "_time" is a Unix epoch (seconds, always UTC by definition -- no
-# local-timezone ambiguity here). Rows with no time found stay NaT
-# rather than being dropped or miscoded as a falsy-but-valid epoch 0.
-timestamps = pd.to_datetime(wide["_time"], unit="s", utc=True).to_numpy()
-# createdate / processdate are ISO-like strings with a numeric UTC
-# offset (e.g. "2024-02-29 03:11:58.210358+11"). utc=True is required
-# here, not optional: Melbourne's offset changes between +11 (AEDT)
-# and +10 (AEST) across the DST boundary, so a file spanning more than
-# a few months will have mixed offsets in this column. Without
-# utc=True, pandas can't build one consistent datetime64 array from
-# mixed offsets and raises a ValueError partway through -- utc=True
-# normalizes everything onto a single UTC timeline first.
-created_at = pd.to_datetime(raw["createdate"], utc=True).to_numpy()
-processed_at = pd.to_datetime(raw["processdate"], utc=True).to_numpy()
+    valid_time_mask = temp_df["timestamps"].notna()
+    sorted_temp = temp_df[valid_time_mask].sort_values("timestamps").reset_index(drop=True)
 
-# ------------------------------------------------------------------
-# 5. Pull out each named variable as a NumPy array with one
-#    vectorized .to_numpy() call per column (no manual per-row
-#    list building).
-# ------------------------------------------------------------------
-battery = wide_vars["Battery"].to_numpy(dtype=float)
-co2 = wide_vars["Carbon dioxide"].to_numpy(dtype=float)
-humidity = wide_vars["Humidity"].to_numpy(dtype=float)
-formaldehyde = wide_vars["Formaldehyde"].to_numpy(dtype=float)
-pressure = wide_vars["Pressure"].to_numpy(dtype=float)
-temperature = wide_vars["Temperature"].to_numpy(dtype=float)
-voc = wide_vars["Light Volatile Organic Compounds"].to_numpy(dtype=float)
-pm1 = wide_vars["Particulate matter 1"].to_numpy(dtype=float)
-pm4 = wide_vars["Particulate matter 4"].to_numpy(dtype=float)
-pm25 = wide_vars["Particulate matter 2.5"].to_numpy(dtype=float)
-pm10 = wide_vars["Particulate matter 10"].to_numpy(dtype=float)
+    if len(sorted_temp) > 0:
+        t_ns = sorted_temp["timestamps"].values.astype("int64")
+        window_ns = pd.Timedelta(days=DAY_BOUND).value  # Two weeks either side
 
-AVAILABLE_VARIABLES = {
-    "battery": (battery, "Battery", "V"),
-    "co2": (co2, "Carbon dioxide", "ppm"),
-    "humidity": (humidity, "Humidity", "HR%"),
-    "formaldehyde": (formaldehyde, "Formaldehyde", "\u00b5g/m3"),
-    "pressure": (pressure, "Pressure", "mb"),
-    "temperature": (temperature, "Temperature", "\u00b0C"),
-    "voc": (voc, "Light Volatile Organic Compounds", "ppb"),
-    "pm1": (pm1, "Particulate matter 1", "\u00b5g/m3"),
-    "pm4": (pm4, "Particulate matter 4", "\u00b5g/m3"),
-    "pm25": (pm25, "Particulate matter 2.5", "\u00b5g/m3"),
-    "pm10": (pm10, "Particulate matter 10", "\u00b5g/m3"),
-}
+        left = np.searchsorted(t_ns, t_ns - window_ns, side="left")
+        right = np.searchsorted(t_ns, t_ns + window_ns, side="right")
+        sorted_temp["neighbor_count"] = right - left
+
+        lone_mask_sorted = sorted_temp["neighbor_count"] < 20
+        lone_rows = sorted_temp[lone_mask_sorted]
+
+        for _, row in lone_rows.iterrows():
+            print(f"[warning] Removing lone point at timestamp {row['timestamps']}: only {sorted_temp.loc[row.name, 'neighbor_count']} reading(s) found within 2 weeks either side.")
+
+        lone_orig_indices = sorted_temp.loc[lone_mask_sorted, "orig_idx"].values
+        keep_mask = np.ones(len(wide), dtype=bool)
+        keep_mask[lone_orig_indices] = False
+    else:
+        keep_mask = np.ones(len(wide), dtype=bool)
+
+    raw = raw.loc[keep_mask].reset_index(drop=True) 
+    wide = wide.loc[keep_mask].reset_index(drop=True) 
+
+    # Guarantee every expected variable exists as a column (missing ones
+    # become all-NaN) in one vectorized reindex.
+    wide_vars = wide.reindex(columns=VARIABLE_NAMES) 
+
+    # ------------------------------------------------------------------
+    # 4. Vectorized date handling: each column is converted once.
+    # ------------------------------------------------------------------
+    row_ids = raw["id"].to_numpy() 
+    timestamps = pd.to_datetime(wide["_time"], unit="s", utc=True).to_numpy() 
+    created_at = pd.to_datetime(raw["createdate"], utc=True).to_numpy() 
+    processed_at = pd.to_datetime(raw["processdate"], utc=True).to_numpy() 
+
+    # ------------------------------------------------------------------
+    # 5. Pull each named variable out as a float NumPy array.
+    # ------------------------------------------------------------------
+    arrays = {name: wide_vars[name].to_numpy(dtype=float) for name in VARIABLE_NAMES} 
+
+    AVAILABLE_VARIABLES = {
+        "battery": (arrays["Battery"], "Battery", "V"), 
+        "co2": (arrays["Carbon dioxide"], "Carbon dioxide", "ppm"), 
+        "humidity": (arrays["Humidity"], "Humidity", "HR%"), 
+        "formaldehyde": (arrays["Formaldehyde"], "Formaldehyde", "\u00b5g/m3"), 
+        "pressure": (arrays["Pressure"], "Pressure", "mb"), 
+        "temperature": (arrays["Temperature"], "Temperature", "\u00b0C"), 
+        "voc": (arrays["Light Volatile Organic Compounds"], "Light Volatile Organic Compounds", "ppb"), 
+        "pm1": (arrays["Particulate matter 1"], "Particulate matter 1", "\u00b5g/m3"), 
+        "pm4": (arrays["Particulate matter 4"], "Particulate matter 4", "\u00b5g/m3"), 
+        "pm25": (arrays["Particulate matter 2.5"], "Particulate matter 2.5", "\u00b5g/m3"),
+        "pm10": (arrays["Particulate matter 10"], "Particulate matter 10", "\u00b5g/m3")
+    }
+
+    return raw, wide, row_ids, timestamps, created_at, processed_at, AVAILABLE_VARIABLES
+
+
+# Backward-compatible module-level exports
+raw, wide, row_ids, timestamps, created_at, processed_at, AVAILABLE_VARIABLES = load_sensor_data()
 
 VARIABLE_TO_MODEL = AVAILABLE_VARIABLES["co2"]
-TIME_TO_MODEL = created_at
+TIME_TO_MODEL = timestamps
