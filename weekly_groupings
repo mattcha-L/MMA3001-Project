@@ -6,7 +6,7 @@ Created on Tue Sep 22 21:53:59 2026
 """
 
 import pandas as pd
- 
+from data_import import row_ids, created_at, TIME_TO_MODEL, VARIABLE_TO_MODEL
 # pandas' "W-XXX" anchor names the day a week *ends* on, not starts on
 # (e.g. "W-MON" = Tue-through-Mon). To get weeks that *start* on a given
 # day, anchor on the day immediately before it.
@@ -70,10 +70,9 @@ if __name__ == "__main__":
     # Example: pull the arrays built by import_sensor_csv.py and group them.
     # Swap this block out for whatever arrays your own import step produced --
     # group_by_week() only needs a `created_at` array plus optional named columns.
-    from MMA3001_Data_Analysis import row_ids, created_at, co2, temperature, humidity, pressure
+    
  
     weekly_groups, weekly_summary = group_by_week(
         created_at,
-        row_id=row_ids, co2=co2, temperature=temperature,
-        humidity=humidity, pressure=pressure,
+        row_id=row_ids, VARIABLE_TO_MODEL=VARIABLE_TO_MODEL[0], TIME_TO_MODEL=TIME_TO_MODEL,
     )

@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Oct 12 23:51:43 2026
+
+@author: myjla
+"""
+
 """
 Incrementally train one Neural Network across multiple weeks, evaluated on a test week
 ========================================================================
@@ -38,6 +45,18 @@ only one continuous model) plus sin/cos encodings of hour-of-day and
 day-of-week, so the network can separate daily/weekly cycles from the
 slower trend.
 
+CROSS-VALIDATION: a single train/test split only tells you how this
+approach does for one particular choice of test week. cross_validate()
+runs WALK-FORWARD cross-validation instead -- for each fold, training
+on an expanding window of the earliest weeks and testing on the very
+next one, sliding forward one week at a time. This is the time-series-
+appropriate analogue of k-fold CV: plain k-fold would shuffle weeks
+randomly across folds, which would let a fold train on weeks that come
+AFTER its own test week -- future information leaking into training,
+which can't happen in a real forecasting setting. Walk-forward CV never
+does that. Each fold trains a completely fresh model from scratch (nothing
+carries over between folds), so folds are independent of each other.
+
 Built directly on import_sensor_csv.py, weekly_grouping.py, and
 visualize_weekly.py (reuses AVAILABLE_VARIABLES, number_weeks, _thin)
 -- no changes needed to any of them, and no dependency on fit_spline.py,
@@ -45,7 +64,7 @@ predict_trends.py, or weekly_trends.py.
 
 Change the settings below, then run this script:
 
-    VARIABLE_TO_PREDICT
+    VARIABLE_TO_MODEL
     TRIAL_WEEKS          -- weeks processed in order, each updating the shared weights
     VALIDATION_WEEKS     -- held out; used only to monitor progress across weeks
     TEST_WEEKS           -- held out; final honest evaluation
@@ -63,25 +82,25 @@ from sklearn.preprocessing import StandardScaler
 
 from data_import import row_ids, created_at
 from weekly_groupings import group_by_week
-from data_visualisation import AVAILABLE_VARIABLES, number_weeks, print_available_weeks, _thin
+from data_visualisation import VARIABLE_TO_MODEL, TIME_TO_MODEL, number_weeks, print_available_weeks, _thin
 
 # ------------------------------------------------------------------
 # Human-changeable settings
 # ------------------------------------------------------------------
-VARIABLE_TO_PREDICT = "co2"        # <- a key from AVAILABLE_VARIABLES
 
-first_half_test = np.arange(0,16).tolist()
+first_half_test = np.arange(1,16).tolist()
 second_half_test = np.arange(18,50).tolist()
+
 TRIAL_WEEKS = second_half_test # <- processed in chronological order; each updates the shared weights
 VALIDATION_WEEKS = [50]             # <- held out from training; used only to monitor progress across weeks
 TEST_WEEKS = [51]                # <- held out from training; final honest evaluation
 MIN_POINTS_PER_WEEK = 10
 
-EPOCHS_PER_WEEK = 50                # partial_fit passes over each week's data before moving to the next
+EPOCHS_PER_WEEK = 150                # partial_fit passes over each week's data before moving to the next
 PLOT_MAX_POINTS = 2000              # thin scatter points for plotting only (training uses all data)
 
 # --- neural network settings ---
-NN_HIDDEN_LAYERS = (64, 32)
+NN_HIDDEN_LAYERS = (32, 64, 32)
 NN_LEARNING_RATE_INIT = 0.001       # partial_fit has no early_stopping, so this and EPOCHS_PER_WEEK
                                      # are what control how much each week can shift the weights
 RANDOM_SEED = 0
@@ -157,9 +176,8 @@ def train_incremental(variable_key, trial_weeks=TRIAL_WEEKS, validation_weeks=VA
     the shared scaler/t0, per-week validation history, and the
     validation/test data.
     """
-    if variable_key not in AVAILABLE_VARIABLES:
-        raise ValueError(f"Unknown variable '{variable_key}'. Choose from: {list(AVAILABLE_VARIABLES)}")
-    values, display_name, unit = AVAILABLE_VARIABLES[variable_key]
+    
+    values, display_name, unit = VARIABLE_TO_MODEL
 
     weekly_groups, _ = group_by_week(created_at, row_id=row_ids, value=values)
     week_numbers = number_weeks(weekly_groups)
@@ -248,7 +266,6 @@ def train_incremental(variable_key, trial_weeks=TRIAL_WEEKS, validation_weeks=VA
 
     return results
 
-
 def plot_incremental_evaluation(results):
     """
     Two panels: (left) the test week's true data vs. the final model's
@@ -257,7 +274,7 @@ def plot_incremental_evaluation(results):
     """
     if results is None or "test_pred" not in results:
         return None
-    trial_data, validation_data, test_data = results["trial_data"], results["validation_data"], results["test_data"]
+    trial_data, test_data = results["trial_data"], results["test_data"]
     display_name, unit = results["display_name"], results["unit"]
     y_pred = results["test_pred"]
 
@@ -266,18 +283,16 @@ def plot_incremental_evaluation(results):
     trial_plot = _thin(trial_data, PLOT_MAX_POINTS)
     ax1.scatter(trial_plot["created_at"], trial_plot["value"], s=10, alpha=0.3, color="steelblue",
                label="Training data (all weeks)")
-    validation_plot = _thin(validation_data, PLOT_MAX_POINTS)
-    ax1.scatter(validation_plot["created_at"], validation_plot["value"], s=10, alpha=0.3, color="green",
-           label="Validation data")
+
     order = np.argsort(test_data["created_at"].to_numpy())
     times_sorted = test_data["created_at"].to_numpy()[order]
     y_true_sorted = test_data["value"].to_numpy()[order]
     y_pred_sorted = y_pred[order]
 
     thin_idx = np.linspace(0, len(times_sorted) - 1, min(PLOT_MAX_POINTS, len(times_sorted))).astype(int)
-    ax1.scatter(times_sorted[thin_idx], y_true_sorted[thin_idx], s=10, alpha=0.3,
+    ax1.scatter(times_sorted[thin_idx], y_true_sorted[thin_idx], s=20, alpha=0.6,
                color="crimson", marker="s", label="True test data")
-    ax1.plot(times_sorted, y_pred_sorted, color="darkorange", linewidth=1, label="Model prediction")
+    ax1.plot(times_sorted, y_pred_sorted, color="darkorange", linewidth=2.5, label="Model prediction")
 
     ax1.set_title(f"{display_name} -- incrementally trained over {results['n_weeks_trained']} week(s)")
     ax1.set_xlabel("Created At")
@@ -299,6 +314,7 @@ def plot_incremental_evaluation(results):
     fig.tight_layout()
     return fig
 
+
 def plot_test_week_only(results):
     """
     A single focused plot: ONLY the test week -- true data vs. the
@@ -311,17 +327,17 @@ def plot_test_week_only(results):
     test_data = results["test_data"]
     display_name, unit = results["display_name"], results["unit"]
     y_pred = results["test_pred"]
- 
+
     order = np.argsort(test_data["created_at"].to_numpy())
     times_sorted = test_data["created_at"].to_numpy()[order]
     y_true_sorted = test_data["value"].to_numpy()[order]
     y_pred_sorted = y_pred[order]
- 
+
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.scatter(times_sorted, y_true_sorted, s=15, alpha=0.6, color="crimson",
               marker="s", label="True test data")
     ax.plot(times_sorted, y_pred_sorted, color="darkorange", linewidth=2.5, label="Model prediction")
- 
+
     ax.set_title(f"{display_name} -- test week only: true vs. predicted "
                  f"(R\u00b2={results['r2']:.3f}, RMSE={results['rmse']:.2f} {unit})")
     ax.set_xlabel("Created At")
@@ -332,35 +348,11 @@ def plot_test_week_only(results):
     fig.tight_layout()
     return fig
 
-def plot_validation_progress(results):
-    """Shows how validation RMSE/R^2 evolved as each successive week's data updated the shared weights."""
-    if results is None:
-        return None
-    history = results.get("validation_history")
-    if not history:
-        return None
-    display_name, unit = results["display_name"], results["unit"]
-    weeks = [h["week_number"] for h in history]
-    rmses = [h["rmse"] for h in history]
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(weeks, rmses, marker="o", color="steelblue")
-    ax.set_xlabel("Training week (in order trained)")
-    ax.set_ylabel(f"Validation RMSE ({unit})")
-    ax.set_title(f"{display_name}: validation error as weeks are incrementally added")
-    ax.grid(True, alpha=0.3, linestyle="--")
-    fig.tight_layout()
-    return fig
-
 
 if __name__ == "__main__":
+    results = train_incremental(VARIABLE_TO_MODEL)
+    if results is not None:
+        plot_incremental_evaluation(results)
+        plot_test_week_only(results)
     print_available_weeks(number_weeks(group_by_week(created_at)[0]))
     print()
-
-    results = train_incremental(VARIABLE_TO_PREDICT)
-    if results is not None:
-        plot_validation_progress(results)
-        plot_incremental_evaluation(results)
-        fig = plot_test_week_only(results)
-        if fig is not None:
-            plt.show()
