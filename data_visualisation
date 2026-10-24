@@ -2,51 +2,47 @@
 """
 Visualize weekly sensor data with automatic gap separation
 ========================================================================
-Plots one chosen environmental variable against time. Automatically detects
-if any selected weeks are more than a month apart and separates them into
-distinct subplots to avoid uninformative empty gaps on the x-axis.
+Plots one environmental variable against time, splitting weeks that are
+more than a month apart into separate subplots.
 
-Built directly on top of data_import.py[cite: 1] and weekly_groupings.py's
-group_by_week()[cite: 3].
+Reads directly from the master DataFrame `data` (data_import_optimised.py).
+Weeks are slices of that table (optimised_weekly_groupings.py), and the
+plotted x/y values are views of its columns -- no per-week or per-chunk
+copies are made.
 
-Change the settings below, then run this script:
-
-    VARIABLE_TO_PLOT     -- which environmental variable to plot (y-axis)
-    WEEKS_TO_PLOT        -- "all", a week number, or a list of week numbers
-    MARKER_SIZE          -- dot size
-    CONNECT_POINTS       -- draw a line between readings, or dots only
-    MAX_POINTS_TOTAL     -- thin out datasets if they have too many points
-    POINT_ALPHA          -- dot transparency (helps with overlapping points)
+Settings:
+    VARIABLE_TO_PLOT -- column name in `data` (see VARIABLES), e.g. "co2"
+    WEEKS_TO_PLOT    -- "all", a week number, a date, or a list of those
+    MARKER_SIZE      -- dot size
+    CONNECT_POINTS   -- draw lines between readings, or dots only
+    MAX_POINTS_TOTAL -- thin each plot to roughly this many points (stride)
+    POINT_ALPHA      -- dot transparency
 ========================================================================
 """
 
+import math
+
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 
-from data_import_optimised import (
-    row_ids, TIME_TO_MODEL, VARIABLE_TO_MODEL
-)
+from optimised_data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
 from optimised_weekly_groupings import group_by_week
 
 # ------------------------------------------------------------------
 # Human-changeable settings
-# ------------------------------------------------------------------
-WEEKS_TO_PLOT = "all"  # <- example with a large gap between week 3 and 20
-# WEEKS_TO_PLOT = "all"
+# ------------------------------------------------------------------ 
+WEEKS_TO_PLOT = "all"
 
-# --- Readability / formatting ---
 MARKER_SIZE = 2            # dot size (scatter "s" units)
 CONNECT_POINTS = False     # False = dots only; True = connect with lines
-MAX_POINTS_TOTAL = None    # e.g. 300 -- if total points exceed this, evenly thin them out
+MAX_POINTS_TOTAL = None    # e.g. 300 -- thin each subplot to about this many points
 POINT_ALPHA = 0.75         # transparency (0-1)
 # ------------------------------------------------------------------
 
 
 def number_weeks(weekly_groups):
     """Assigns each week a 1-indexed number in chronological order."""
-    sorted_weeks = sorted(weekly_groups)
-    return {i + 1: week for i, week in enumerate(sorted_weeks)}
+    return {i + 1: week for i, week in enumerate(sorted(weekly_groups))}
 
 
 def print_available_weeks(week_numbers):
@@ -55,44 +51,46 @@ def print_available_weeks(week_numbers):
         print(f"  {number}: week of {week_start.date()}")
 
 
-def _thin(group, max_points):
-    """Evenly downsamples readings, keeping the first and last rows."""
-    if max_points is None or len(group) <= max_points:
-        return group
-    idx = sorted(set(np.linspace(0, len(group) - 1, max_points).round().astype(int)))
-    return group.iloc[idx]
+def _merge_runs(slices):
+    """Merges slices that touch end-to-end, so adjacent weeks become one view."""
+    runs = []
+    for sl in slices:
+        if runs and runs[-1].stop == sl.start:
+            runs[-1] = slice(runs[-1].start, sl.stop)
+        else:
+            runs.append(sl)
+    return runs
 
 
-def plot_separated_by_gaps(variable_key=VARIABLE_TO_MODEL, weeks_to_plot="all", gap_threshold_days=31):
+def plot_separated_by_gaps(variable=VARIABLE_TO_MODEL, weeks_to_plot=WEEKS_TO_PLOT,
+                           gap_threshold_days=31):
     """
-    Draws selected weeks, automatically splitting them into separate subplots
-    whenever consecutive weeks are separated by more than `gap_threshold_days`.
+    Draws selected weeks, splitting them into separate subplots whenever
+    consecutive weeks are more than `gap_threshold_days` apart.
     """
-    values, display_name, unit = variable_key
+    display_name, unit = VARIABLES[variable]
+    ts = data[TIME_COL]        # references to master columns, not copies
+    values = data[variable]
 
-    # Retrieve weekly groups using group_by_week[cite: 3]
-    weekly_groups = group_by_week(TIME_TO_MODEL, row_id=row_ids, value=values)
+    weekly_groups = group_by_week(data)   # {week_start: slice into `data`}
     week_numbers = number_weeks(weekly_groups)
 
     if weeks_to_plot == "all":
         selected_weeks = sorted(weekly_groups)
     else:
-        requested = [weeks_to_plot] if isinstance(weeks_to_plot, (int, str, pd.Timestamp)) else list(weeks_to_plot)
-
+        requested = ([weeks_to_plot] if isinstance(weeks_to_plot, (int, str, pd.Timestamp))
+                     else list(weeks_to_plot))
         selected_weeks, missing = [], []
         for item in requested:
             if isinstance(item, int):
-                if item in week_numbers:
-                    selected_weeks.append(week_numbers[item])
-                else:
-                    missing.append(item)
+                week = week_numbers.get(item)
             else:
-                week_start = pd.Timestamp(item)
-                if week_start in weekly_groups:
-                    selected_weeks.append(week_start)
-                else:
-                    missing.append(item)
-
+                week = pd.Timestamp(item)
+                week = week if week in weekly_groups else None
+            if week is None:
+                missing.append(item)
+            else:
+                selected_weeks.append(week)
         selected_weeks = sorted(set(selected_weeks))
         if missing:
             print(f"[warning] no data for requested week number/date(s): {missing}")
@@ -102,43 +100,42 @@ def plot_separated_by_gaps(variable_key=VARIABLE_TO_MODEL, weeks_to_plot="all", 
         print_available_weeks(week_numbers)
         return None
 
-    # Group selected weeks into chunks where any gap between adjacent weeks > gap_threshold_days
-    week_chunks = []
-    if selected_weeks:
-        current_chunk = [selected_weeks[0]]
-        for prev_week, curr_week in zip(selected_weeks[:-1], selected_weeks[1:]):
-            if (curr_week - prev_week) > pd.Timedelta(days=gap_threshold_days):
-                week_chunks.append(current_chunk)
-                current_chunk = [curr_week]
-            else:
-                current_chunk.append(curr_week)
-        week_chunks.append(current_chunk)
-
-    # Create subplots for each distinct time chunk
-    fig, axes = plt.subplots(len(week_chunks), 1, figsize=(12, 4 * len(week_chunks)), squeeze=False)
-    
-    for i, (ax, chunk) in enumerate(zip(axes[:, 0], week_chunks)):
-        combined_chunk_group = pd.concat([weekly_groups[w] for w in chunk]).sort_values("timestamps")
-        combined_chunk_group = _thin(combined_chunk_group, MAX_POINTS_TOTAL)
-
-        if CONNECT_POINTS:
-            ax.plot(combined_chunk_group["timestamps"], combined_chunk_group["value"], marker="o",
-                     markersize=MARKER_SIZE ** 0.5, alpha=POINT_ALPHA, label=display_name if i == 0 else "")
+    # Split into chunks wherever adjacent selected weeks are > gap_threshold_days apart.
+    gap = pd.Timedelta(days=gap_threshold_days)
+    week_chunks = [[selected_weeks[0]]]
+    for prev_week, curr_week in zip(selected_weeks[:-1], selected_weeks[1:]):
+        if curr_week - prev_week > gap:
+            week_chunks.append([curr_week])
         else:
-            ax.scatter(combined_chunk_group["timestamps"], combined_chunk_group["value"], s=MARKER_SIZE,
-                       alpha=POINT_ALPHA, edgecolors="none", label=display_name if i == 0 else "")
+            week_chunks[-1].append(curr_week)
 
-        start_date = chunk[0].date()
-        end_date = (chunk[-1] + pd.Timedelta(days=7)).date()
-        ax.set_title(f"{display_name} -- Period: {start_date} to {end_date} ({len(chunk)} week(s))")
+    fig, axes = plt.subplots(len(week_chunks), 1, figsize=(12, 4 * len(week_chunks)),
+                             squeeze=False)
+
+    for i, (ax, chunk) in enumerate(zip(axes[:, 0], week_chunks)):
+        runs = _merge_runs([weekly_groups[w] for w in chunk])
+        total = sum(r.stop - r.start for r in runs)
+        stride = 1 if MAX_POINTS_TOTAL is None else max(1, math.ceil(total / MAX_POINTS_TOTAL))
+
+        for j, run in enumerate(runs):
+            view = slice(run.start, run.stop, stride)        # still a view of the master
+            x, y = ts.iloc[view], values.iloc[view]
+            label = display_name if (i == 0 and j == 0) else "_nolegend_"
+            if CONNECT_POINTS:
+                ax.plot(x, y, marker="o", markersize=MARKER_SIZE ** 0.5,
+                        alpha=POINT_ALPHA, label=label)
+            else:
+                ax.scatter(x, y, s=MARKER_SIZE, alpha=POINT_ALPHA,
+                           edgecolors="none", label=label)
+
+        start = chunk[0]
+        end = chunk[-1] + pd.Timedelta(days=7)
+        ax.set_title(f"{display_name} -- Period: {start.date()} to {end.date()} ({len(chunk)} week(s))")
         ax.set_xlabel("Timestamp")
         ax.set_ylabel(f"{display_name} ({unit})")
         ax.tick_params(axis="x", rotation=30)
         ax.grid(True, alpha=0.3, linestyle="--")
-        
-        # Bound x-axis explicitly to the range of this chunk
-        ax.set_xlim(chunk[0], chunk[-1] + pd.Timedelta(days=7))
-        
+        ax.set_xlim(start, end)
         if i == 0:
             ax.legend(loc="upper right")
 
@@ -147,7 +144,7 @@ def plot_separated_by_gaps(variable_key=VARIABLE_TO_MODEL, weeks_to_plot="all", 
 
 
 if __name__ == "__main__":
-    fig = plot_separated_by_gaps(VARIABLE_TO_MODEL, WEEKS_TO_PLOT)
+    fig = plot_separated_by_gaps()
     if fig is not None:
         fig.savefig("separated_gaps_variable_plot.png", dpi=150)
         plt.show()
