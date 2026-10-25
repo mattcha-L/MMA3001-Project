@@ -15,7 +15,7 @@ How the data is built
   1. The CSV is read once and (optionally) filtered by sensor id.
   2. The rows are SPLIT BY SENSOR ID, and each sensor is parsed on its own:
      JSON -> one float column per variable, undated rows removed, rows sorted by time,
-     "lone" points removed (judged against that sensor's own readings).
+     sporadic runs removed (judged against that sensor's own readings).
   3. The per-sensor blocks are RECOMBINED, in sensor-id order, into ONE master
      table `data` with columns
 
@@ -59,8 +59,9 @@ import pandas as pd
 PATH = "5EnvSensor_MayToDec2024_180kRows.csv"  # Path to the CSV file; change as needed.
 SENSOR_IDS_INCLUDE = None   # only load these sensor ids, e.g. ["A12", "A13"]; None = all sensors
 SENSOR_IDS_EXCLUDE = None   # skip these sensor ids, e.g. ["A14"]
-DAY_BOUND = 14          # a reading is "lone" if too few neighbours lie within +/- this many days
-MIN_NEIGHBOURS = 20     # ...fewer than this many readings (including itself), within ONE sensor
+LONE_GAP_DAYS = 1       # readings further apart than this (days) start a new "run"
+MIN_RUN_DISTINCT = 20   # runs with fewer DISTINCT readings than this are sporadic and removed
+                        # (exact repeats of time AND values count once, so bursts of repeats are caught)
 
 # (column name in `data`, exact JSON "name" field, unit)
 VARIABLE_SPEC = (
@@ -185,8 +186,10 @@ def _parse_sensor(sensor_id, rows):
     Parses ONE sensor's raw CSV rows into a block: one float column per variable plus
     `_time` (Unix seconds), `id`, `sensorid` and the two date strings, sorted by time.
 
-    Removes unreadable rows, undated rows and lone points (< MIN_NEIGHBOURS readings within
-    DAY_BOUND days either side, counted within this sensor only). Does NOT remove duplicates.
+    Removes unreadable rows, undated rows and sporadic data: readings are split into runs
+    wherever the gap between consecutive readings exceeds LONE_GAP_DAYS, and runs with fewer
+    than MIN_RUN_DISTINCT distinct readings are dropped (per sensor). Exact repeats (same time
+    and same values) count once, so a burst of repeats is sporadic. Repeats in dense runs are kept.
     Warns (without removing anything) if the sensor reports a constant value for a variable.
     Returns None if nothing is left.
     """
@@ -215,13 +218,26 @@ def _parse_sensor(sensor_id, rows):
     order = candidates[np.argsort(t[candidates], kind="stable")]   # time-sorted row positions
     t_sorted = t[order]
 
-    window = DAY_BOUND * 86400.0
-    neighbours = (np.searchsorted(t_sorted, t_sorted + window, side="right")
-                  - np.searchsorted(t_sorted, t_sorted - window, side="left"))
-    lone = neighbours < MIN_NEIGHBOURS
-    for ts, n in zip(pd.to_datetime(t_sorted[lone], unit="s", utc=True), neighbours[lone]):
-        print(f"[warning] sensor {label}: removing lone point at {ts}: only {n} reading(s) within "
-              f"{DAY_BOUND} days either side.")
+    # Split the time-sorted readings into runs at every gap larger than LONE_GAP_DAYS.
+    breaks = np.flatnonzero(np.diff(t_sorted) > LONE_GAP_DAYS * 86400.0) + 1
+    starts = np.concatenate(([0], breaks))
+    stops = np.concatenate((breaks, [len(t_sorted)]))
+    sizes = stops - starts                              # readings per run
+    if len(t_sorted):
+        # Distinct readings per run: exact repeats of time AND every value count only once.
+        is_new = ~wide.iloc[order].duplicated().to_numpy()
+        distinct = np.add.reduceat(is_new.astype(int), starts)
+    else:
+        distinct = sizes
+    # Runs with too few distinct readings are sporadic; mark every reading in them for removal.
+    sporadic = distinct < MIN_RUN_DISTINCT
+    lone = np.repeat(sporadic, sizes)
+    for a, b, n, d in zip(starts[sporadic], stops[sporadic], sizes[sporadic], distinct[sporadic]):
+        if n == 0:
+            continue
+        first, last = pd.to_datetime([t_sorted[a], t_sorted[b - 1]], unit="s", utc=True)
+        print(f"[warning] sensor {label}: removing sporadic run of {n} reading(s), {d} distinct "
+              f"({first} to {last}): fewer than {MIN_RUN_DISTINCT}.")
     order = order[~lone]
 
     if len(order) == 0:
