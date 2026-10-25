@@ -21,9 +21,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-import optimised_neural_network as nn
-from optimised_weekly_groupings import group_by_week
-from optimised_data_visualisation import number_weeks
+import neural_network as nn
+from weekly_groupings import group_by_week
+from data_visualisation import number_weeks
 
 # ------------------------------------------------------------------
 # Human-changeable settings
