@@ -1,93 +1,48 @@
 # -*- coding: utf-8 -*-
 """
-Created on Sun Sep 27 13:28:01 2026
-
-@author: myjla
-"""
-
-"""
-Visualize weekly sensor data
+Visualize weekly sensor data with automatic gap separation
 ========================================================================
-Plots one chosen environmental variable against time, drawing a
-SEPARATE graph for each selected week. Built directly on top of
-import_sensor_csv.py (raw arrays) and weekly_groupings.py's
-group_by_week() (weekly buckets) -- no changes needed to either file.
+Plots one environmental variable against time, splitting weeks that are
+more than a month apart into separate subplots.
 
-Uses `created_at` (when the row was created/uploaded to the database)
-as the time axis, not `timestamps` (when the sensor reading was
-actually taken) -- per the current convention for this project.
+Reads directly from the master DataFrame `data` (data_import_optimised.py).
+Weeks are slices of that table (optimised_weekly_groupings.py), and the
+plotted x/y values are views of its columns -- no per-week or per-chunk
+copies are made.
 
-Change the settings below, then run this script:
-
-    VARIABLE_TO_PLOT     -- which environmental variable to plot (y-axis)
-    WEEKS_TO_PLOT        -- "all", a week number, or a list of week numbers
-    MARKER_SIZE          -- dot size
-    CONNECT_POINTS       -- draw a line between readings, or dots only
-    MAX_POINTS_PER_WEEK  -- thin out a week with too many readings
-    POINT_ALPHA          -- dot transparency (helps with overlapping points)
-
-Weeks are numbered 1, 2, 3, ... in chronological order. Run the script
-once to print the numbered list of weeks actually present in your
-data, then set WEEKS_TO_PLOT to whichever number(s) you want.
+Settings:
+    VARIABLE_TO_PLOT -- column name in `data` (see VARIABLES), e.g. "co2"
+    WEEKS_TO_PLOT    -- "all", a week number, a date, or a list of those
+    MARKER_SIZE      -- dot size
+    CONNECT_POINTS   -- draw lines between readings, or dots only
+    MAX_POINTS_TOTAL -- thin each plot to roughly this many points (stride)
+    POINT_ALPHA      -- dot transparency
 ========================================================================
 """
+
+import math
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 
-from data_import import (
-    row_ids, TIME_TO_MODEL, VARIABLE_TO_MODEL
-)
+from data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
 from weekly_groupings import group_by_week
 
 # ------------------------------------------------------------------
 # Human-changeable settings
-# ------------------------------------------------------------------
-VARIABLE_TO_PLOT = VARIABLE_TO_MODEL  # <- change to any key in AVAILABLE_VARIABLES below
+# ------------------------------------------------------------------ 
+WEEKS_TO_PLOT = "all"
 
-WEEKS_TO_PLOT = [1,2,3]
-# WEEKS_TO_PLOT = 2        # <- or a single week number
-# WEEKS_TO_PLOT = [1, 3]   # <- or several week numbers, one graph each
-# WEEKS_TO_PLOT = ["2023-12-05"]   # <- exact week-start dates still work too
-# Total weeks: 51
-
-# --- Readability / formatting ---
-MARKER_SIZE = 70          # dot size (scatter "s" units) -- bigger = easier to spot individual readings
-CONNECT_POINTS = False    # False = dots only (default). A line between readings can be
-                           # misleading here: readings are often irregularly spaced in time,
-                           # so a straight line implies a trend between points that may be
-                           # hours or days apart, which didn't actually happen.
-MAX_POINTS_PER_WEEK = None # e.g. 60 -- if a week has more readings than this, evenly thin
-                            # them out so the plot doesn't turn into an overplotted smear.
-                            # None = show every reading.
-POINT_ALPHA = 0.75         # transparency (0-1) -- lower helps when points overlap
-# ------------------------------------------------------------------
-
-# Maps a short, typeable key to (array, display name, unit) for each variable.
-# Add/remove entries here if import_sensor_csv.py's variable list changes.
-"""
-AVAILABLE_VARIABLES = {
-    "battery": (battery, "Battery", "V"),
-    "co2": (co2, "Carbon dioxide", "ppm"),
-    "humidity": (humidity, "Humidity", "HR%"),
-    "formaldehyde": (formaldehyde, "Formaldehyde", "\u00b5g/m3"),
-    "pressure": (pressure, "Pressure", "mb"),
-    "temperature": (temperature, "Temperature", "\u00b0C"),
-    "voc": (voc, "Light Volatile Organic Compounds", "ppb"),
-    "pm1": (pm1, "Particulate matter 1", "\u00b5g/m3"),
-    "pm4": (pm4, "Particulate matter 4", "\u00b5g/m3"),
-    "pm25": (pm25, "Particulate matter 2.5", "\u00b5g/m3"),
-    "pm10": (pm10, "Particulate matter 10", "\u00b5g/m3"),
-}
-"""
+MARKER_SIZE = 2            # dot size (scatter "s" units)
+CONNECT_POINTS = False     # False = dots only; True = connect with lines
+MAX_POINTS_TOTAL = None    # e.g. 300 -- thin each subplot to about this many points
+POINT_ALPHA = 0.75         # transparency (0-1)
 # ------------------------------------------------------------------
 
 
 def number_weeks(weekly_groups):
     """Assigns each week a 1-indexed number in chronological order."""
-    sorted_weeks = sorted(weekly_groups)
-    return {i + 1: week for i, week in enumerate(sorted_weeks)}
+    return {i + 1: week for i, week in enumerate(sorted(weekly_groups))}
 
 
 def print_available_weeks(week_numbers):
@@ -96,56 +51,46 @@ def print_available_weeks(week_numbers):
         print(f"  {number}: week of {week_start.date()}")
 
 
-def _thin(group, max_points):
-    """
-    Evenly downsamples `group` to at most `max_points` rows (keeping the
-    first and last), so a densely-sampled week doesn't turn into an
-    unreadable smear of overlapping dots. None or already-small groups
-    pass through unchanged.
-    """
-    if max_points is None or len(group) <= max_points:
-        return group
-    idx = sorted(set(np.linspace(0, len(group) - 1, max_points).round().astype(int)))
-    return group.iloc[idx]
+def _merge_runs(slices):
+    """Merges slices that touch end-to-end, so adjacent weeks become one view."""
+    runs = []
+    for sl in slices:
+        if runs and runs[-1].stop == sl.start:
+            runs[-1] = slice(runs[-1].start, sl.stop)
+        else:
+            runs.append(sl)
+    return runs
 
 
-def plot_weekly(variable_key=VARIABLE_TO_MODEL, weeks_to_plot="all"):
+def plot_separated_by_gaps(variable=VARIABLE_TO_MODEL, weeks_to_plot=WEEKS_TO_PLOT,
+                           gap_threshold_days=31):
     """
-    Draws one time-series subplot per selected week for the chosen
-    variable, x-axis = created_at. Returns the Figure (or None if
-    there was nothing to plot).
-
-    variable_key : one of AVAILABLE_VARIABLES' keys, e.g. "co2"
-    weeks_to_plot : "all"; a week number (1, 2, 3, ... in chronological
-                    order); a list mixing week numbers and/or exact
-                    week-start dates (strings like "2023-12-05",
-                    pandas Timestamps, or datetimes).
+    Draws selected weeks, splitting them into separate subplots whenever
+    consecutive weeks are more than `gap_threshold_days` apart.
     """
-    values, display_name, unit = VARIABLE_TO_MODEL
+    display_name, unit = VARIABLES[variable]
+    ts = data[TIME_COL]        # references to master columns, not copies
+    values = data[variable]
 
-    weekly_groups, _ = group_by_week(TIME_TO_MODEL, row_id=row_ids, value=values)
+    weekly_groups = group_by_week(data)   # {week_start: slice into `data`}
     week_numbers = number_weeks(weekly_groups)
 
     if weeks_to_plot == "all":
         selected_weeks = sorted(weekly_groups)
     else:
-        # accept a single number as well as a list
-        requested = [weeks_to_plot] if isinstance(weeks_to_plot, (int, str, pd.Timestamp)) else list(weeks_to_plot)
-
+        requested = ([weeks_to_plot] if isinstance(weeks_to_plot, (int, str, pd.Timestamp))
+                     else list(weeks_to_plot))
         selected_weeks, missing = [], []
         for item in requested:
             if isinstance(item, int):
-                if item in week_numbers:
-                    selected_weeks.append(week_numbers[item])
-                else:
-                    missing.append(item)
+                week = week_numbers.get(item)
             else:
-                week_start = pd.Timestamp(item)
-                if week_start in weekly_groups:
-                    selected_weeks.append(week_start)
-                else:
-                    missing.append(item)
-
+                week = pd.Timestamp(item)
+                week = week if week in weekly_groups else None
+            if week is None:
+                missing.append(item)
+            else:
+                selected_weeks.append(week)
         selected_weeks = sorted(set(selected_weeks))
         if missing:
             print(f"[warning] no data for requested week number/date(s): {missing}")
@@ -155,36 +100,51 @@ def plot_weekly(variable_key=VARIABLE_TO_MODEL, weeks_to_plot="all"):
         print_available_weeks(week_numbers)
         return None
 
-    fig, axes = plt.subplots(len(selected_weeks), 1, figsize=(10, 4 * len(selected_weeks)), squeeze=False)
-    for ax, week_start in zip(axes[:, 0], selected_weeks):
-        # column is named "created_at" inside the group regardless of what
-        # array group_by_week() was called with -- here that's created_at
-        group = weekly_groups[week_start].sort_values("created_at")
-        group = _thin(group, MAX_POINTS_PER_WEEK)
-
-        if CONNECT_POINTS:
-            ax.plot(group["created_at"], group["value"], marker="o",
-                     markersize=MARKER_SIZE ** 0.5, alpha=POINT_ALPHA)
+    # Split into chunks wherever adjacent selected weeks are > gap_threshold_days apart.
+    gap = pd.Timedelta(days=gap_threshold_days)
+    week_chunks = [[selected_weeks[0]]]
+    for prev_week, curr_week in zip(selected_weeks[:-1], selected_weeks[1:]):
+        if curr_week - prev_week > gap:
+            week_chunks.append([curr_week])
         else:
-            ax.scatter(group["created_at"], group["value"], s=MARKER_SIZE,
-                       alpha=POINT_ALPHA, edgecolors="none")
+            week_chunks[-1].append(curr_week)
 
-        ax.set_title(f"{display_name} -- week of {week_start.date()}")
-        ax.set_xlabel("Created At")
+    fig, axes = plt.subplots(len(week_chunks), 1, figsize=(12, 4 * len(week_chunks)),
+                             squeeze=False)
+
+    for i, (ax, chunk) in enumerate(zip(axes[:, 0], week_chunks)):
+        runs = _merge_runs([weekly_groups[w] for w in chunk])
+        total = sum(r.stop - r.start for r in runs)
+        stride = 1 if MAX_POINTS_TOTAL is None else max(1, math.ceil(total / MAX_POINTS_TOTAL))
+
+        for j, run in enumerate(runs):
+            view = slice(run.start, run.stop, stride)        # still a view of the master
+            x, y = ts.iloc[view], values.iloc[view]
+            label = display_name if (i == 0 and j == 0) else "_nolegend_"
+            if CONNECT_POINTS:
+                ax.plot(x, y, marker="o", markersize=MARKER_SIZE ** 0.5,
+                        alpha=POINT_ALPHA, label=label)
+            else:
+                ax.scatter(x, y, s=MARKER_SIZE, alpha=POINT_ALPHA,
+                           edgecolors="none", label=label)
+
+        start = chunk[0]
+        end = chunk[-1] + pd.Timedelta(days=7)
+        ax.set_title(f"{display_name} -- Period: {start.date()} to {end.date()} ({len(chunk)} week(s))")
+        ax.set_xlabel("Timestamp")
         ax.set_ylabel(f"{display_name} ({unit})")
         ax.tick_params(axis="x", rotation=30)
         ax.grid(True, alpha=0.3, linestyle="--")
-        # Bound the x-axis to the actual calendar week rather than letting
-        # matplotlib auto-scale from the data -- with only one reading in
-        # a week, auto-scaling produces an absurdly wide, uninformative range.
-        ax.set_xlim(week_start, week_start + pd.Timedelta(days=7))
+        ax.set_xlim(start, end)
+        if i == 0:
+            ax.legend(loc="upper right")
 
     fig.tight_layout()
     return fig
 
 
 if __name__ == "__main__":
-    fig = plot_weekly(VARIABLE_TO_PLOT, WEEKS_TO_PLOT)
+    fig = plot_separated_by_gaps()
     if fig is not None:
-        fig.savefig("weekly_variable_plot.png", dpi=150)
+        fig.savefig("separated_gaps_variable_plot.png", dpi=150)
         plt.show()
