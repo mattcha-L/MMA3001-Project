@@ -18,8 +18,8 @@ Documentation:
 1. data_import.py\
   a. set path (default: 5EnvSensor_MayToDec2024_180kRows.csv)\
   b. set variable names of environmental data (default: Battery, Carbon dioxide, Humidity, Formaldehyde, Pressure, Temperatures, Light Volatile Organic Compounds, Particulate matter 1, Particular matter 4, Particulate matter 2.5, Particulate matter 10)
-2. weekly_groupings.py\
-3. data_visualisation.py\
+2. weekly_groupings.py
+3. data_visualisation.py
 4. neural_network.py\
    a. set TRIAL_WEEKS, VALIDATION_WEEKS, TEST_WEEKS, MIN_POINTS_PER_WEEK, EPOCHS_PER_WEEK, PLOT_MAX_POINTS, NN_HIDDEN_LAYERS, NN_LEARNING_RATE_INIT, RANDOM_SEED as learning parameters for the model ensuring trial, validation and test weeks do not overlap.
 5. hyperparameter_tests.py\
