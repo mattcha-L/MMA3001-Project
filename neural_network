@@ -44,22 +44,20 @@ import pandas as pd
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 
-from optimised_data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
-from optimised_weekly_groupings import group_by_week
-from optimised_data_visualisation import number_weeks, print_available_weeks
+from data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
+from weekly_groupings import group_by_week
+from data_visualisation import number_weeks, print_available_weeks
 
 # ------------------------------------------------------------------
 # Human-changeable settings
 # ------------------------------------------------------------------
-first_half_test = np.arange(3, 18).tolist()
-second_half_test = np.arange(19, 48).tolist()
-
-TRIAL_WEEKS = second_half_test     # processed in chronological order; each updates the shared weights
-VALIDATION_WEEKS = [48]            # held out; used only to monitor progress across weeks
-TEST_WEEKS = [49]                  # held out; final honest evaluation
+selected_weeks = np.arange(2,34).tolist()
+TRIAL_WEEKS = selected_weeks      # processed in chronological order; each updates the shared weights
+VALIDATION_WEEKS = [33]            # held out; used only to monitor progress across weeks
+TEST_WEEKS = [34]                  # held out; final honest evaluation
 MIN_POINTS_PER_WEEK = 10
 
-EPOCHS_PER_WEEK = 20              # partial_fit passes per week. Many passes on one week can overfit it
+EPOCHS_PER_WEEK = 10              # partial_fit passes per week. Many passes on one week can overfit it
                                    # and forget earlier weeks; try e.g. 20-30 and compare validation RMSE.
 VALIDATE_EVERY = 1                 # score the validation set every N trained weeks (last week always scored)
 PLOT_MAX_POINTS = 2000             # thin scatter points for plotting only (training uses all data)
@@ -403,7 +401,6 @@ if __name__ == "__main__":
     weekly = group_by_week(data)                 # computed once, reused everywhere
     week_numbers = number_weeks(weekly)
     print_available_weeks(week_numbers)
-
     results = train_incremental(weekly=weekly, week_numbers=week_numbers)
     if results is not None:
         plot_validation_progress(results)
