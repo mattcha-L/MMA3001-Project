@@ -11,8 +11,6 @@ RMSE is within TOLERANCE of the best, since small differences are mostly noise.
 The structure and seed are set via the module-level settings in
 optimised_neural_network (NN_HIDDEN_LAYERS, RANDOM_SEED) and restored afterwards.
 
-Outputs:
-    sweep_results.csv and sweep_results.png in the working directory.
 """
 
 import contextlib
@@ -23,9 +21,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-import neural_network as nn
-from weekly_groupings import group_by_week
-from data_visualisation import number_weeks
+import optimised_neural_network as nn
+from optimised_weekly_groupings import group_by_week
+from optimised_data_visualisation import number_weeks
 
 # ------------------------------------------------------------------
 # Human-changeable settings
@@ -162,7 +160,6 @@ def main():
         return None
 
     df = pd.DataFrame(rows).sort_values("val_rmse").reset_index(drop=True)
-    df.to_csv("sweep_results.csv", index=False)
 
     # ---- Pick: cheapest configuration within TOLERANCE of the best validation RMSE ----
     best = df.iloc[0]
@@ -190,9 +187,6 @@ def main():
     print("Validation (recommended configuration): " + ", ".join(parts))
     nn.plot_incremental_evaluation(result)
 
-    fig = plot_results(df, recommended)
-    fig.savefig("sweep_results.png", dpi=150)
-    print("Saved sweep_results.csv and sweep_results.png")
     plt.show()
     return df, result
 
