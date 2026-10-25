@@ -11,7 +11,7 @@ week; nothing is duplicated.
 import numpy as np
 import pandas as pd
 
-from data_import import data, TIME_COL
+from optimised_data_import import data, TIME_COL
 
 _WEEKDAY = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
 
@@ -45,5 +45,7 @@ def group_by_week(df, week_start_day="MON", time_col=TIME_COL):
 
 if __name__ == "__main__":
     weekly = group_by_week(data)
+    counter = 1
     for week, sl in weekly.items():
-        print(f"{week.date()}: {sl.stop - sl.start} readings")
+        print(f"{counter}. {week.date()}: {sl.stop - sl.start} readings")
+        counter+=1
