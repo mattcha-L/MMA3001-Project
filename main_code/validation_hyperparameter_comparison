@@ -186,7 +186,7 @@ def main():
         parts.append(f"rRMSE {rr * 100:.3f}%")
     print("Validation (recommended configuration): " + ", ".join(parts))
     nn.plot_incremental_evaluation(result)
-
+    plot_results(df, recommended)
     plt.show()
     return df, result
 
