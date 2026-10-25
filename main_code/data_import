@@ -26,8 +26,6 @@ Helpers:
 Sensor filter (applied before any JSON is parsed; ids are matched as text):
     SENSOR_IDS_INCLUDE: Only load these sensors, e.g. ["A12", "A13"]; None = all.
     SENSOR_IDS_EXCLUDE: Skip these sensors, e.g. ["A14"].
-
-Run this file directly to write data_grouped_by_sensor.csv.
 """
 
 import json
@@ -190,7 +188,7 @@ def _warn_if_constant(label, block):
         print(f"[warning] sensor {label}: ALL readings are identical. "
               f"The sensor may be stuck or faulty.")
     else:
-        print(f"[warning] sensor {label}: the same value in some readings. "
+        print(f"[warning] sensor {label}: the same value in some readings. {detail}"
               f"The sensor may be stuck or faulty.")
 
 
@@ -380,15 +378,6 @@ def sensor_summary():
     return summary.rename_axis("sensorid")
 
 
-def save_grouped(path="data_grouped_by_sensor.csv"):
-    """Writes the master table to CSV (sensor blocks in order, time-sorted within each).
-
-    Args:
-        path: Output CSV path.
-    """
-    data.to_csv(path, index=False)
-
-
 # Module-level master table. Everything else should reference this object.
 full_data = load_sensor_data()
 SENSOR_SLICES = group_by_sensor(full_data)   # {sensorid: slice into `data`}; views, not copies
@@ -400,4 +389,3 @@ VARIABLE_TO_MODEL = "co2"   # column name in `data`; look up metadata in VARIABL
 
 if __name__ == "__main__":
     pd.set_option("display.width", 200, "display.max_columns", 30)
-    save_grouped()
