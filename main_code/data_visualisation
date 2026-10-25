@@ -17,8 +17,8 @@ import math
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
-from weekly_groupings import group_by_week
+from optimised_data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
+from optimised_weekly_groupings import group_by_week
 
 # ------------------------------------------------------------------
 # Human-changeable settings
@@ -165,5 +165,4 @@ def plot_separated_by_gaps(variable=VARIABLE_TO_MODEL, weeks_to_plot=WEEKS_TO_PL
 if __name__ == "__main__":
     fig = plot_separated_by_gaps()
     if fig is not None:
-        fig.savefig("separated_gaps_variable_plot.png", dpi=150)
         plt.show()
