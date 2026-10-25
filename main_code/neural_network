@@ -33,17 +33,17 @@ import pandas as pd
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 
-from data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
-from weekly_groupings import group_by_week
-from data_visualisation import number_weeks, print_available_weeks
+from optimised_data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
+from optimised_weekly_groupings import group_by_week
+from optimised_data_visualisation import number_weeks, print_available_weeks
 
 # ------------------------------------------------------------------
 # Human-changeable settings
 # ------------------------------------------------------------------
-selected_weeks = np.arange(2,32).tolist()
+selected_weeks = np.arange(2,31).tolist()
 TRIAL_WEEKS = selected_weeks      # trained on in chronological order
-VALIDATION_WEEKS = [32]            # held out; monitors progress across weeks
-TEST_WEEKS = [33]                  # held out; final honest evaluation
+VALIDATION_WEEKS = [31]            # held out; monitors progress across weeks
+TEST_WEEKS = [32]                  # held out; final honest evaluation
 MIN_POINTS_PER_WEEK = 10           # weeks with fewer readings are skipped
 
 EPOCHS_PER_WEEK = 10              # partial_fit passes per week; too many can overfit the week
@@ -53,7 +53,7 @@ PLOT_MAX_POINTS = 2000             # thin scatter points for plotting only
 # --- neural network settings ---
 NN_ACTIVATION = 'relu'
 #'relu', 'identity', 'tanh', 'logistic'
-NN_HIDDEN_LAYERS = (32, 32, 64, 32, 32)
+NN_HIDDEN_LAYERS = (32, 32, 32)
 NN_ALPHA = 0.001                   # passed to MLPRegressor as learning_rate_init
 RANDOM_SEED = 0
 # ------------------------------------------------------------------
