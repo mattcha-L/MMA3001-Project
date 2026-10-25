@@ -46,7 +46,7 @@ ARCHITECTURES = [
     (32, 32, 64, 32),             # your current structure, as the baseline to beat
     (32, 32, 64, 32, 32),         # deeper variant of your current structure
 ]
-EPOCH_OPTIONS = [5, 10, 15, 20, 30]      # epochs-per-week values tried for every structure
+EPOCH_OPTIONS = [10, 20, 30]      # epochs-per-week values tried for every structure
 
 SEEDS = [0]                       # e.g. [0, 1, 2] to average out random-init noise (3x the time)
 TOLERANCE = 0.015                 # "within 1.5% of best RMSE" counts as equally good
