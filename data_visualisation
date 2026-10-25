@@ -1,23 +1,15 @@
 # -*- coding: utf-8 -*-
-"""
-Visualize weekly sensor data with automatic gap separation
-========================================================================
-Plots one environmental variable against time, splitting weeks that are
-more than a month apart into separate subplots.
+"""Plot one sensor variable against time, splitting large gaps into subplots.
 
-Reads directly from the master DataFrame `data` (data_import_optimised.py).
-Weeks are slices of that table (optimised_weekly_groupings.py), and the
-plotted x/y values are views of its columns -- no per-week or per-chunk
-copies are made.
+Weeks more than a month apart go on separate subplots. Data is read directly
+from the master DataFrame `data`; plotted values are views, not copies.
 
 Settings:
-    VARIABLE_TO_PLOT -- column name in `data` (see VARIABLES), e.g. "co2"
-    WEEKS_TO_PLOT    -- "all", a week number, a date, or a list of those
-    MARKER_SIZE      -- dot size
-    CONNECT_POINTS   -- draw lines between readings, or dots only
-    MAX_POINTS_TOTAL -- thin each plot to roughly this many points (stride)
-    POINT_ALPHA      -- dot transparency
-========================================================================
+    WEEKS_TO_PLOT: "all", a week number, a date, or a list of those.
+    MARKER_SIZE: Dot size.
+    CONNECT_POINTS: Draw lines between readings, or dots only.
+    MAX_POINTS_TOTAL: Thin each subplot to roughly this many points.
+    POINT_ALPHA: Dot transparency.
 """
 
 import math
@@ -25,8 +17,8 @@ import math
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
-from weekly_groupings import group_by_week
+from optimised_data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
+from optimised_weekly_groupings import group_by_week
 
 # ------------------------------------------------------------------
 # Human-changeable settings
@@ -41,22 +33,41 @@ POINT_ALPHA = 0.75         # transparency (0-1)
 
 
 def number_weeks(weekly_groups):
-    """Assigns each week a 1-indexed number in chronological order."""
+    """Numbers weeks chronologically, starting at 1.
+
+    Args:
+        weekly_groups: Dict keyed by week start.
+
+    Returns:
+        Dict of week number -> week start.
+    """
     return {i + 1: week for i, week in enumerate(sorted(weekly_groups))}
 
 
 def print_available_weeks(week_numbers):
+    """Prints each week number with its start date.
+
+    Args:
+        week_numbers: Dict of week number -> week start.
+    """
     print("Available weeks:")
     for number, week_start in week_numbers.items():
         print(f"  {number}: week of {week_start.date()}")
 
 
 def _merge_runs(slices):
-    """Merges slices that touch end-to-end, so adjacent weeks become one view."""
+    """Merges slices that touch end-to-end so adjacent weeks become one view.
+
+    Args:
+        slices: Row slices in chronological order.
+
+    Returns:
+        List of merged slices.
+    """
     runs = []
     for sl in slices:
         if runs and runs[-1].stop == sl.start:
-            runs[-1] = slice(runs[-1].start, sl.stop)
+            runs[-1] = slice(runs[-1].start, sl.stop)    # extend the previous run
         else:
             runs.append(sl)
     return runs
@@ -64,9 +75,15 @@ def _merge_runs(slices):
 
 def plot_separated_by_gaps(variable=VARIABLE_TO_MODEL, weeks_to_plot=WEEKS_TO_PLOT,
                            gap_threshold_days=31):
-    """
-    Draws selected weeks, splitting them into separate subplots whenever
-    consecutive weeks are more than `gap_threshold_days` apart.
+    """Plots the selected weeks, with a new subplot after each large gap.
+
+    Args:
+        variable: Column name in `data` (see VARIABLES).
+        weeks_to_plot: "all", a week number, a date, or a list of those.
+        gap_threshold_days: Weeks further apart than this start a new subplot.
+
+    Returns:
+        The matplotlib Figure, or None if no weeks matched.
     """
     display_name, unit = VARIABLES[variable]
     ts = data[TIME_COL]        # references to master columns, not copies
@@ -75,6 +92,7 @@ def plot_separated_by_gaps(variable=VARIABLE_TO_MODEL, weeks_to_plot=WEEKS_TO_PL
     weekly_groups = group_by_week(data)   # {week_start: slice into `data`}
     week_numbers = number_weeks(weekly_groups)
 
+    # ---- work out which weeks to plot ----
     if weeks_to_plot == "all":
         selected_weeks = sorted(weekly_groups)
     else:
@@ -109,6 +127,7 @@ def plot_separated_by_gaps(variable=VARIABLE_TO_MODEL, weeks_to_plot=WEEKS_TO_PL
         else:
             week_chunks[-1].append(curr_week)
 
+    # ---- one subplot per chunk ----
     fig, axes = plt.subplots(len(week_chunks), 1, figsize=(12, 4 * len(week_chunks)),
                              squeeze=False)
 
@@ -120,7 +139,7 @@ def plot_separated_by_gaps(variable=VARIABLE_TO_MODEL, weeks_to_plot=WEEKS_TO_PL
         for j, run in enumerate(runs):
             view = slice(run.start, run.stop, stride)        # still a view of the master
             x, y = ts.iloc[view], values.iloc[view]
-            label = display_name if (i == 0 and j == 0) else "_nolegend_"
+            label = display_name if (i == 0 and j == 0) else "_nolegend_"   # one legend entry only
             if CONNECT_POINTS:
                 ax.plot(x, y, marker="o", markersize=MARKER_SIZE ** 0.5,
                         alpha=POINT_ALPHA, label=label)
@@ -129,7 +148,7 @@ def plot_separated_by_gaps(variable=VARIABLE_TO_MODEL, weeks_to_plot=WEEKS_TO_PL
                            edgecolors="none", label=label)
 
         start = chunk[0]
-        end = chunk[-1] + pd.Timedelta(days=7)
+        end = chunk[-1] + pd.Timedelta(days=7)    # last week runs for 7 days
         ax.set_title(f"{display_name} -- Period: {start.date()} to {end.date()} ({len(chunk)} week(s))")
         ax.set_xlabel("Timestamp")
         ax.set_ylabel(f"{display_name} ({unit})")
