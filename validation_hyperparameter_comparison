@@ -1,28 +1,18 @@
 # -*- coding: utf-8 -*-
-"""
-Hyperparameter sweep for the incrementally trained neural network
-========================================================================
-Trains every hidden-layer structure with each epochs-per-week option
-(structure x epochs). Activation and L2 alpha are whatever neural_network_optimised.py is set to.
+"""Hyperparameter sweep for the incrementally trained neural network.
 
-Selection AND reporting use VALIDATION data only. The test week is never
-used to choose anything and is not reported by this script.
+Trains every hidden-layer structure with each epochs-per-week option. Activation
+and L2 alpha come from optimised_neural_network.py.
 
-Recommended = the CHEAPEST (fastest) configuration whose validation RMSE is
-within TOLERANCE of the best one, since small differences are mostly noise.
+Selection and reporting use validation data only; the test week is never used.
+The recommended configuration is the cheapest (fastest) one whose validation
+RMSE is within TOLERANCE of the best, since small differences are mostly noise.
 
-How it calls the model: the structure and random seed are set through the
-module-level settings in neural_network_optimised (NN_HIDDEN_LAYERS,
-RANDOM_SEED), which train_incremental reads at call time. This script passes
-only long-standing arguments to train_incremental, so it works with any
-version of that file. The original settings are restored when it finishes.
+The structure and seed are set via the module-level settings in
+optimised_neural_network (NN_HIDDEN_LAYERS, RANDOM_SEED) and restored afterwards.
 
-Efficiency: the master data, weekly grouping and per-variable preparation are
-shared by every run; each run scores validation only after its final week and
-prints nothing.
-
-Outputs: sweep_results.csv and sweep_results.png in the working directory.
-========================================================================
+Outputs:
+    sweep_results.csv and sweep_results.png in the working directory.
 """
 
 import contextlib
@@ -33,16 +23,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-import neural_network as nn
-from weekly_groupings import group_by_week
-from data_visualisation import number_weeks
+import optimised_neural_network as nn
+from optimised_weekly_groupings import group_by_week
+from optimised_data_visualisation import number_weeks
 
 # ------------------------------------------------------------------
 # Human-changeable settings
 # ------------------------------------------------------------------
 ARCHITECTURES = [
     (32, 32), (64, 64),           # two layers: most likely sweet spot
-    (32, 32, 32), (32, 64, 32)    # uniform three layer
+    (32, 32, 32), (32, 64, 32),   # uniform three layer
     (32, 32, 64, 32),             # your current structure, as the baseline to beat
     (32, 32, 64, 32, 32),         # deeper variant of your current structure
 ]
@@ -60,13 +50,32 @@ N_INPUTS = 5   # elapsed time + sin/cos(hour) + sin/cos(day of week)
 
 
 def n_params(arch, n_inputs=N_INPUTS):
-    """Trainable parameters (weights + biases) of an MLP with a single output."""
+    """Counts trainable parameters (weights + biases) of an MLP with one output.
+
+    Args:
+        arch: Tuple of hidden-layer sizes.
+        n_inputs: Number of input features.
+
+    Returns:
+        Total parameter count.
+    """
     sizes = [n_inputs, *arch, 1]
     return sum(a * b + b for a, b in zip(sizes[:-1], sizes[1:]))
 
 
 def run_config(arch, epochs, weekly, week_numbers):
-    """Trains once per seed; returns (summary row, best-seed results), or None if unusable."""
+    """Trains one configuration once per seed and scores it on validation.
+
+    Args:
+        arch: Tuple of hidden-layer sizes.
+        epochs: Epochs per week.
+        weekly: Precomputed week slices, shared across runs.
+        week_numbers: Precomputed week numbering, shared across runs.
+
+    Returns:
+        Tuple of (summary row dict, results from the best seed), or None if
+        any run produced no validation result.
+    """
     rmses, seconds, best = [], [], None
     for seed in SEEDS:
         nn.NN_HIDDEN_LAYERS = arch      # read by train_incremental at call time
@@ -78,7 +87,7 @@ def run_config(arch, epochs, weekly, week_numbers):
         seconds.append(time.perf_counter() - t0)
         if r is None or not r["validation_history"]:
             return None
-        rmse = r["validation_history"][-1]["rmse"]
+        rmse = r["validation_history"][-1]["rmse"]    # validation after the final week only
         if best is None or rmse < min(rmses):
             best = r
         rmses.append(rmse)
@@ -90,6 +99,15 @@ def run_config(arch, epochs, weekly, week_numbers):
 
 
 def plot_results(df, recommended):
+    """Plots validation RMSE against training time for every configuration.
+
+    Args:
+        df: Sweep results with structure, epochs, params, val_rmse and seconds columns.
+        recommended: Row of `df` to circle as the recommended configuration.
+
+    Returns:
+        The matplotlib Figure.
+    """
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.scatter(df["seconds"], df["val_rmse"], s=25 + df["params"] / 60, alpha=0.6, color="steelblue")
     ax.scatter([recommended["seconds"]], [recommended["val_rmse"]], s=160, facecolors="none",
@@ -107,6 +125,12 @@ def plot_results(df, recommended):
 
 
 def main():
+    """Runs the sweep, saves the results and plot, and prints the recommendation.
+
+    Returns:
+        Tuple of (results DataFrame, results of the recommended run), or None
+        if no run succeeded.
+    """
     print(f"Using {nn.__file__}")
     saved = (nn.NN_HIDDEN_LAYERS, nn.RANDOM_SEED)
     try:
