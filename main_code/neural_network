@@ -33,9 +33,9 @@ import pandas as pd
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 
-from optimised_data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
-from optimised_weekly_groupings import group_by_week
-from optimised_data_visualisation import number_weeks, print_available_weeks
+from data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
+from weekly_groupings import group_by_week
+from data_visualisation import number_weeks, print_available_weeks
 
 # ------------------------------------------------------------------
 # Human-changeable settings
