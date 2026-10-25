@@ -1,5 +1,5 @@
 """
-Import a sensor-log CSV into ONE master DataFrame
+Import a sensor-log CSV into ONE master DataFrame, grouped by sensor
 ========================================================================
 Expects a comma-delimited CSV with a header row:
 
@@ -10,23 +10,44 @@ Expects a comma-delimited CSV with a header row:
     {"values": [{"time": 1702273965, "value": 603}],
      "variable": {"id": 67, "name": "Carbon dioxide", "unit": "ppm", ...}}
 
-Design: single source of truth
+How the data is built
 ------------------------------------------------------------------------
-Everything lives in `data`, one DataFrame with columns
+  1. The CSV is read once and (optionally) filtered by sensor id.
+  2. The rows are SPLIT BY SENSOR ID, and each sensor is parsed on its own:
+     JSON -> one float column per variable, undated rows removed, rows sorted by time,
+     "lone" points removed (judged against that sensor's own readings).
+  3. The per-sensor blocks are RECOMBINED, in sensor-id order, into ONE master
+     table `data` with columns
 
-    id, sensorid, timestamp, created_at, processed_at, <one float column per variable>
+         id, sensorid, timestamp, created_at, processed_at, <one float column per variable>
 
-Nothing else holds a copy of the readings:
+There is NO deduplication step: every readable, dated reading is kept, including exact
+repeats.
 
-  * VARIABLES is metadata only (display name + unit), keyed by column name.
-  * Other modules get a variable with `data["co2"]` (a reference, no copy)
-    and a time range with `data.iloc[a:b]` / `series.iloc[a:b]` (views).
-  * The raw JSON text, the intermediate "wide" frame, the per-variable
-    arrays and the filter temporaries are all discarded; every filter
-    (duplicates, undated rows, lone points) is combined into ONE row
-    selection, so the table is only materialised once.
-  * Rows are sorted by timestamp, so any week / date range is a contiguous
-    slice of the master table.
+`data` is GROUPED BY SENSOR: each sensor's rows form one contiguous block, in time
+order within the block. It is therefore NOT sorted by time across sensors. Rows
+with no sensor id form their own block, placed last.
+
+  * SENSOR_SLICES      {sensorid: slice into `data`}  (rows with no id: "(missing)")
+  * get_sensor("A12")  one sensor's rows, as a VIEW of `data` (no copy)
+  * iter_sensors()     yields (sensorid, view) for each sensor
+  * sensor_summary()   rows, first/last timestamp and readings per variable, per sensor
+  * save_grouped(path) writes the grouped table to CSV
+  * VARIABLES          metadata only (display name + unit), keyed by column name
+
+Run this file directly to print the summary and write data_grouped_by_sensor.csv.
+
+SENSOR FILTER
+------------------------------------------------------------------------
+Optionally load only some sensors, chosen by the CSV `sensorid` column:
+
+    SENSOR_IDS_INCLUDE -- only these sensors   e.g. ["A12", "A13"]  (None = all sensors)
+    SENSOR_IDS_EXCLUDE -- skip these sensors   e.g. ["A14"]
+
+The filter runs straight after the CSV is read, BEFORE any JSON is parsed, so
+unwanted sensors cost nothing. Ids are matched as text, so 7 matches "7". Both
+lists may be given (include AND NOT exclude). `list_sensors()` shows the sensor
+ids in the file.
 ========================================================================
 """
 
@@ -36,14 +57,10 @@ import numpy as np
 import pandas as pd
 
 PATH = "5EnvSensor_MayToDec2024_180kRows.csv"  # Path to the CSV file; change as needed.
+SENSOR_IDS_INCLUDE = None   # only load these sensor ids, e.g. ["A12", "A13"]; None = all sensors
+SENSOR_IDS_EXCLUDE = None   # skip these sensor ids, e.g. ["A14"]
 DAY_BOUND = 14          # a reading is "lone" if too few neighbours lie within +/- this many days
-MIN_NEIGHBOURS = 20     # ...fewer than this many readings (including itself)
-
-# Two rows are duplicates only if ALL their readings, their timestamp AND every column listed here match.
-# "sensorid" stops identical readings from different sensors being merged. Add "createdate" and/or
-# "processdate" to be stricter (a re-sent message with a new processdate would then be KEPT); never add "id"
-# unless every id is meant to be distinct -- it is unique per row, so nothing would ever count as a duplicate.
-DEDUP_EXTRA = ("sensorid",)
+MIN_NEIGHBOURS = 20     # ...fewer than this many readings (including itself), within ONE sensor
 
 # (column name in `data`, exact JSON "name" field, unit)
 VARIABLE_SPEC = (
@@ -100,53 +117,101 @@ def _parse_row(text):
     return record
 
 
-def load_sensor_data(path=PATH):
-    """
-    Reads the CSV and returns the single master DataFrame.
+def _as_id_set(ids):
+    """None, one id, or any iterable of ids -> set of stripped text ids (or None)."""
+    if ids is None:
+        return None
+    if isinstance(ids, (str, int, np.integer, float, np.floating)):
+        ids = [ids]
+    cleaned = set()
+    for i in ids:
+        if isinstance(i, (float, np.floating)) and float(i).is_integer():
+            i = int(i)                                   # 5.0 -> "5"
+        cleaned.add(str(i).strip())
+    return cleaned
 
-    Removes unreadable rows, duplicates (same readings + timestamp + DEDUP_EXTRA columns),
-    undated rows and lone points
-    (< MIN_NEIGHBOURS readings within DAY_BOUND days either side), and sorts
-    the result by timestamp.
-    """
-    # 1. Read only the columns we need (vectorised C-level CSV parsing).
-    usecols = list(dict.fromkeys(["id", "jsondata", "createdate", "processdate", *DEDUP_EXTRA]))
-    raw = pd.read_csv(path, dtype=str, usecols=usecols)
 
-    # 2. Parse JSON once per row; the raw text is popped out and freed.
-    parsed = raw.pop("jsondata").map(_parse_row)
+def list_sensors(path=PATH):
+    """Sensor ids in the CSV and how many rows each has (reads only the sensorid column; fast)."""
+    return pd.read_csv(path, dtype=str, usecols=["sensorid"])["sensorid"].value_counts(dropna=False)
+
+
+def _filter_sensors(raw, include, exclude):
+    """Keeps only the rows of the selected sensors. Runs before any JSON is parsed."""
+    include, exclude = _as_id_set(include), _as_id_set(exclude)
+    if include is None and exclude is None:
+        return raw
+
+    text = raw["sensorid"].fillna("")
+    keep = np.ones(len(raw), dtype=bool)
+    if include is not None:
+        keep &= text.isin(include).to_numpy()
+    if exclude is not None:
+        keep &= ~text.isin(exclude).to_numpy()
+
+    present = set(text.unique())
+    missing = sorted(((include or set()) | (exclude or set())) - present)
+    if missing:
+        print(f"[warning] sensor id(s) not found in the file: {missing}")
+    if not keep.any():
+        raise ValueError("The sensor filter matched no rows. Sensors in the file:\n"
+                         + text.value_counts().to_string())
+    return raw.loc[keep].reset_index(drop=True)
+
+
+def _warn_if_constant(label, block):
+    """
+    Warns when a sensor reports exactly the same value in EVERY reading of a variable (needs at
+    least 2 readings of it), which usually means a stuck or faulty sensor. If every variable the
+    sensor reports is constant, i.e. all its readings are identical, the warning says so.
+    """
+    values = block[VALUE_COLUMNS]
+    count = values.count()                                   # readings per variable (NaN excluded)
+    constant = (count >= 2) & (values.min() == values.max())
+    if not constant.any():
+        return
+    detail = ", ".join(f"{VARIABLES[c][0]} = {values[c].iloc[values[c].first_valid_index()]:g} "
+                       f"({count[c]} readings)" for c in constant.index[constant])
+    if constant[count > 0].all():
+        print(f"[warning] sensor {label}: ALL readings are identical. "
+              f"The sensor may be stuck or faulty.")
+    else:
+        print(f"[warning] sensor {label}: the same value in some readings. "
+              f"The sensor may be stuck or faulty.")
+
+
+def _parse_sensor(sensor_id, rows):
+    """
+    Parses ONE sensor's raw CSV rows into a block: one float column per variable plus
+    `_time` (Unix seconds), `id`, `sensorid` and the two date strings, sorted by time.
+
+    Removes unreadable rows, undated rows and lone points (< MIN_NEIGHBOURS readings within
+    DAY_BOUND days either side, counted within this sensor only). Does NOT remove duplicates.
+    Warns (without removing anything) if the sensor reports a constant value for a variable.
+    Returns None if nothing is left.
+    """
+    label = "(missing)" if pd.isna(sensor_id) else sensor_id
+    rows = rows.reset_index(drop=True)
+
+    # JSON -> flat dicts, one parse per row; unreadable rows dropped.
+    parsed = rows["jsondata"].map(_parse_row)
     bad = parsed.isna().to_numpy()
     if bad.any():
-        print(f"[skip] {bad.sum()} row(s) with unreadable jsondata: ids {raw.loc[bad, 'id'].tolist()}")
-        raw = raw.loc[~bad]
-        parsed = parsed.loc[~bad]
+        print(f"[skip] sensor {label}: {bad.sum()} row(s) with unreadable jsondata: "
+              f"ids {rows.loc[bad, 'id'].tolist()}")
+        rows = rows.loc[~bad].reset_index(drop=True)
+        parsed = parsed.loc[~bad].reset_index(drop=True)
 
-    # 3. One wide table, one float column per variable (missing -> all-NaN).
-    data = pd.DataFrame(parsed.tolist(), columns=[*VALUE_COLUMNS, "_time"]).astype(float)
-    del parsed
+    # One wide table, one float column per variable (missing -> all-NaN).
+    wide = pd.DataFrame(parsed.tolist(), columns=[*VALUE_COLUMNS, "_time"]).astype(float)
 
-    for col in dict.fromkeys(["id", "createdate", "processdate", *DEDUP_EXTRA]):
-        data[col] = raw[col].to_numpy()
-    del raw
-
-    # A duplicate matches on readings + timestamp + every DEDUP_EXTRA column (not just readings + time)
-    dup = data.duplicated(subset=[*VALUE_COLUMNS, "_time", *DEDUP_EXTRA], keep="first").to_numpy()
-    if DEDUP_EXTRA:
-        readings_only = data.duplicated(subset=[*VALUE_COLUMNS, "_time"], keep="first").to_numpy()
-        spared = readings_only & ~dup
-        if spared.any():
-            print(f"[info] keeping {spared.sum()} row(s) whose readings and timestamp match another row "
-                  f"but differ in {', '.join(DEDUP_EXTRA)}")
-
-    # 4. Work out which rows survive, and in what order, on a bare numpy array.
-    t = data["_time"].to_numpy()                       # Unix seconds, NaN if undated
+    # Which rows survive, and in what (time) order, decided on a bare numpy array.
+    t = wide["_time"].to_numpy()                       # Unix seconds, NaN if undated
     undated = np.isnan(t)
-    if dup.any():
-        print(f"[info] removing {dup.sum()} duplicate reading(s)")
-    if (undated & ~dup).any():
-        print(f"[warning] {(undated & ~dup).sum()} reading(s) had no timestamp and were removed")
+    if undated.any():
+        print(f"[warning] sensor {label}: {undated.sum()} reading(s) had no timestamp and were removed")
 
-    candidates = np.flatnonzero(~dup & ~undated)
+    candidates = np.flatnonzero(~undated)
     order = candidates[np.argsort(t[candidates], kind="stable")]   # time-sorted row positions
     t_sorted = t[order]
 
@@ -155,27 +220,116 @@ def load_sensor_data(path=PATH):
                   - np.searchsorted(t_sorted, t_sorted - window, side="left"))
     lone = neighbours < MIN_NEIGHBOURS
     for ts, n in zip(pd.to_datetime(t_sorted[lone], unit="s", utc=True), neighbours[lone]):
-        print(f"[warning] Removing lone point at {ts}: only {n} reading(s) within "
+        print(f"[warning] sensor {label}: removing lone point at {ts}: only {n} reading(s) within "
               f"{DAY_BOUND} days either side.")
     order = order[~lone]
 
-    # 5. Materialise the master table exactly once.
-    data = data.iloc[order].reset_index(drop=True)
+    if len(order) == 0:
+        print(f"[warning] sensor {label}: no rows left after cleaning -- sensor dropped")
+        return None
 
-    # 6. Dates converted once per column, taken from final_data's OWN rows. (Converting the unfiltered
-    #    `data` columns and inserting them here would attach each timestamp to the wrong row, because
-    #    final_data has been filtered and re-sorted.)
+    block = wide.iloc[order].reset_index(drop=True)
+    _warn_if_constant(label, block)
+    block["id"] = rows["id"].to_numpy()[order]
+    block["sensorid"] = sensor_id
+    block["createdate"] = rows["createdate"].to_numpy()[order]
+    block["processdate"] = rows["processdate"].to_numpy()[order]
+    return block
+
+
+def load_sensor_data(path=PATH, sensor_ids_include=SENSOR_IDS_INCLUDE,
+                     sensor_ids_exclude=SENSOR_IDS_EXCLUDE):
+    """
+    Reads the CSV, splits it by sensor id, parses each sensor separately and recombines the
+    blocks into the single master DataFrame, grouped by sensor (sensor-id order, time-sorted
+    within each sensor).
+
+    `sensor_ids_include` / `sensor_ids_exclude` optionally restrict the load to some sensors
+    (see SENSOR FILTER in the module docstring); None = no restriction.
+    """
+    # 1. Read only the columns we need (vectorised C-level CSV parsing).
+    raw = pd.read_csv(path, dtype=str,
+                      usecols=["id", "sensorid", "jsondata", "createdate", "processdate"])
+    raw["sensorid"] = raw["sensorid"].str.strip()
+    raw = _filter_sensors(raw, sensor_ids_include, sensor_ids_exclude)   # before any JSON parsing
+
+    # 2. Split by sensor id and parse each sensor on its own (rows with no sensor id form a last group).
+    blocks = []
+    for sensor_id, rows in raw.groupby("sensorid", sort=True, dropna=False):
+        block = _parse_sensor(sensor_id, rows)
+        if block is not None:
+            blocks.append(block)
+    del raw
+    if not blocks:
+        raise ValueError("No rows left after parsing and cleaning. Check the CSV and the sensor filter.")
+
+    # 3. Recombine into ONE master table, grouped by sensor.
+    data = pd.concat(blocks, ignore_index=True)
+    del blocks
+
+    # 4. Final column layout; dates converted once per column over the whole table.
     data.insert(0, "id", data.pop("id"))
-    data["timestamp"] = pd.to_datetime(data.pop("_time"), unit="s", utc=True)
-    data["created_at"] = pd.to_datetime(data.pop("createdate"), utc=True)
-    data["processed_at"] = pd.to_datetime(data.pop("processdate"), utc=True)
-    id_cols = ["id", *[c for c in DEDUP_EXTRA if c != "id"]]
-    data = data[[*id_cols, "timestamp", "created_at", "processed_at", *VALUE_COLUMNS]]
-    return data   # `data` is the unfiltered table: data[dup] shows exactly what was removed
+    data.insert(1, "sensorid", data.pop("sensorid").astype("category"))   # few distinct values: compact
+    data.insert(2, "timestamp", pd.to_datetime(data.pop("_time"), unit="s", utc=True))
+    data.insert(3, "created_at", pd.to_datetime(data.pop("createdate"), utc=True))
+    data.insert(4, "processed_at", pd.to_datetime(data.pop("processdate"), utc=True))
+    return data
+
+
+def group_by_sensor(df):
+    """
+    {sensorid: slice into `df`} for a table whose sensors form contiguous blocks, as built by
+    load_sensor_data. Rows with no sensor id are keyed "(missing)". Slices are views, not copies.
+    """
+    codes = df["sensorid"].cat.codes.to_numpy()             # -1 for a missing sensor id
+    cuts = np.flatnonzero(np.diff(codes)) + 1
+    starts = np.concatenate(([0], cuts))
+    stops = np.concatenate((cuts, [len(codes)]))
+    if len(starts) != len(np.unique(codes)):
+        raise ValueError("Sensors are not contiguous in the table; it is not grouped by sensor.")
+    categories = df["sensorid"].cat.categories
+    return {(categories[codes[a]] if codes[a] >= 0 else "(missing)"): slice(int(a), int(b))
+            for a, b in zip(starts, stops)}
+
+
+def get_sensor(sensor_id):
+    """One sensor's rows (time-sorted) as a view of the master table; nothing is copied."""
+    key = str(sensor_id).strip()
+    if key not in SENSOR_SLICES:
+        raise KeyError(f"Unknown sensor id {sensor_id!r}. Available: {list(SENSOR_SLICES)}")
+    return data.iloc[SENSOR_SLICES[key]]
+
+
+def iter_sensors():
+    """Yields (sensorid, view of that sensor's rows) in table order."""
+    for sensor_id, sl in SENSOR_SLICES.items():
+        yield sensor_id, data.iloc[sl]
+
+
+def sensor_summary():
+    """One row per sensor: row count, first/last timestamp, and non-missing readings per variable."""
+    summary = data.groupby("sensorid", observed=True, dropna=False)["timestamp"].agg(
+        rows="size", first="min", last="max")
+    counts = data[VALUE_COLUMNS].notna().groupby(data["sensorid"], observed=True, dropna=False).sum()
+    summary = summary.join(counts)
+    summary.index = summary.index.astype(object).where(summary.index.notna(), "(missing)")
+    return summary.rename_axis("sensorid")
+
+
+def save_grouped(path="data_grouped_by_sensor.csv"):
+    """Writes the grouped master table to CSV (sensor blocks in order, time-sorted within each)."""
+    data.to_csv(path, index=False)
 
 
 # Module-level master table. Everything else should reference this object.
-data = load_sensor_data()
+full_data = load_sensor_data()
+SENSOR_SLICES = group_by_sensor(full_data)   # {sensorid: slice into `data`}; views, not copies
+data = full_data[full_data["sensorid"]=="6012002000326"]
 
 TIME_COL = "timestamp"
 VARIABLE_TO_MODEL = "co2"   # column name in `data`; look up metadata in VARIABLES
+
+
+if __name__ == "__main__":
+    pd.set_option("display.width", 200, "display.max_columns", 30)
+    save_grouped()
