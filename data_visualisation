@@ -25,8 +25,8 @@ import math
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from optimised_data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
-from optimised_weekly_groupings import group_by_week
+from data_import import data, VARIABLES, VARIABLE_TO_MODEL, TIME_COL
+from weekly_groupings import group_by_week
 
 # ------------------------------------------------------------------
 # Human-changeable settings
