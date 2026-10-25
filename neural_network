@@ -65,7 +65,7 @@ PLOT_MAX_POINTS = 2000             # thin scatter points for plotting only (trai
 # --- neural network settings ---
 NN_ACTIVATION = 'relu'
 #'relu', 'identity', 'tanh', 'logistic'
-NN_HIDDEN_LAYERS = (32, 32, 64, 32, 32)
+NN_HIDDEN_LAYERS = (32, 64, 32)
 NN_ALPHA = 0.001
 RANDOM_SEED = 0
 # ------------------------------------------------------------------
