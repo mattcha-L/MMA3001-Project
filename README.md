@@ -1,7 +1,7 @@
 # MMA3001-Project
 <img width="1189" height="490" alt="epoch10layers3232643232data0232" src="https://github.com/user-attachments/assets/94eed03b-f3e5-421e-8bbd-f3de914ee052" />
 Figure 1. Example output
-\n
+
 Repository for MMA3001 Project
 
 # Purpose
