@@ -17,18 +17,19 @@ Documentation:
 - Requires data to be in a format consistent with Monash Smart Infrastructure Occupancy and Environmental Data, however this can be easily adjusted in data_import.py
 
 ## How to use
-1. data_import.py\
+1. data_import.py - to download data into a usable form\
   a. set path (default: 5EnvSensor_MayToDec2024_180kRows.csv)\
   b. set variable names of environmental data (default: Battery, Carbon dioxide, Humidity, Formaldehyde, Pressure, Temperatures, Light Volatile Organic Compounds, Particulate matter 1, Particular matter 4, Particulate matter 2.5, Particulate matter 10)
-2. weekly_groupings.py
-3. data_visualisation.py\
+2. weekly_groupings.py - to separate data into weeks to train\
+   a. no need to set anything
+4. data_visualisation.py - to visualise the overall weeks that could be trained on\
    a. set visualisation parameters to view data
-5. neural_network.py\
+5. neural_network.py - to train a neural network model\
    a. set TRIAL_WEEKS, VALIDATION_WEEKS, TEST_WEEKS, MIN_POINTS_PER_WEEK, EPOCHS_PER_WEEK, PLOT_MAX_POINTS, NN_HIDDEN_LAYERS, NN_LEARNING_RATE_INIT, RANDOM_SEED as learning parameters for the model ensuring trial, validation and test weeks do not overlap.
-6. hyperparameter_tests.py\
+6. hyperparameter_tests.py - to check different architectures and epochs for optimal solution based on validation data\
    a. set neural network architectures and epochs to test\
    b. set random seed and tolerance
-7. results_and_cross_validation\
+7. results_and_cross_validation - to check neural network against different training, testing data\
    a. set number of folds and random seed\
    b. set the minimum number of weeks a fold must use
 
