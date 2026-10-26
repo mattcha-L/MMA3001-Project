@@ -1,5 +1,6 @@
 # MMA3001-Project
 <img width="1189" height="490" alt="epoch10layers3232643232data0232" src="https://github.com/user-attachments/assets/94eed03b-f3e5-421e-8bbd-f3de914ee052" />
+Figure 1. Example output\
 Repository for MMA3001 Project
 
 # Purpose
@@ -19,15 +20,16 @@ Documentation:
   a. set path (default: 5EnvSensor_MayToDec2024_180kRows.csv)\
   b. set variable names of environmental data (default: Battery, Carbon dioxide, Humidity, Formaldehyde, Pressure, Temperatures, Light Volatile Organic Compounds, Particulate matter 1, Particular matter 4, Particulate matter 2.5, Particulate matter 10)
 2. weekly_groupings.py
-3. data_visualisation.py
-4. neural_network.py\
+3. data_visualisation.py\
+   a. set visualisation parameters to view data
+5. neural_network.py\
    a. set TRIAL_WEEKS, VALIDATION_WEEKS, TEST_WEEKS, MIN_POINTS_PER_WEEK, EPOCHS_PER_WEEK, PLOT_MAX_POINTS, NN_HIDDEN_LAYERS, NN_LEARNING_RATE_INIT, RANDOM_SEED as learning parameters for the model ensuring trial, validation and test weeks do not overlap.
-5. hyperparameter_tests.py\
+6. hyperparameter_tests.py\
    a. set neural network architectures and epochs to test\
-   b. set random seed and tolerance (default: 0 and 0.015)
-6. results_and_cross_validation\
+   b. set random seed and tolerance
+7. results_and_cross_validation\
    a. set number of folds and random seed\
-   b. set the minimum number of weeks a fold must use (default: 3)
+   b. set the minimum number of weeks a fold must use
 
 # Environment
 - Uses packages from the Anaconda base (root) environment
